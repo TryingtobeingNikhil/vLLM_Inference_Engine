@@ -1,0 +1,105 @@
+{
+  "validation_config": {
+    "num_requests": 5,
+    "max_new_tokens": 50,
+    "prompt_length_chars": 545
+  },
+  "wall_clock_log": [
+    {
+      "from_request": 1,
+      "to_request": 2,
+      "gap_between_ms": 0.073,
+      "sequential": true
+    },
+    {
+      "from_request": 2,
+      "to_request": 3,
+      "gap_between_ms": 0.054,
+      "sequential": true
+    },
+    {
+      "from_request": 3,
+      "to_request": 4,
+      "gap_between_ms": 0.05,
+      "sequential": true
+    },
+    {
+      "from_request": 4,
+      "to_request": 5,
+      "gap_between_ms": 0.053,
+      "sequential": true
+    }
+  ],
+  "results": [
+    {
+      "request_index": 1,
+      "wall_start": 1781730386.076652,
+      "wall_end": 1781730388.4613209,
+      "wall_duration_ms": 2384.6688270568848,
+      "ttft_ms": 1209.5783329568803,
+      "total_latency_ms": 2356.952332891524,
+      "tokens_per_second": 21.21383589402493,
+      "prompt_tokens": 98,
+      "generated_tokens": 50,
+      "gpu_memory_allocated_mb": 950.542724609375,
+      "gpu_memory_reserved_mb": 158.015625,
+      "generated_text": " The transformer architecture is a type of neural network that is commonly used in natural language processing (NLP) tasks. It is based on the idea of self-attention, which allows the model to learn long-range dependencies in sequences without recurrence. The key"
+    },
+    {
+      "request_index": 2,
+      "wall_start": 1781730388.4613938,
+      "wall_end": 1781730389.643908,
+      "wall_duration_ms": 1182.5141906738281,
+      "ttft_ms": 16.636458691209555,
+      "total_latency_ms": 1180.9936673380435,
+      "tokens_per_second": 42.33722955746229,
+      "prompt_tokens": 98,
+      "generated_tokens": 50,
+      "gpu_memory_allocated_mb": 950.542724609375,
+      "gpu_memory_reserved_mb": 162.46875,
+      "generated_text": " The transformer architecture is a type of neural network that is commonly used in natural language processing (NLP) tasks. It is based on the idea of self-attention, which allows the model to learn long-range dependencies in sequences without recurrence. The key"
+    },
+    {
+      "request_index": 3,
+      "wall_start": 1781730389.6439621,
+      "wall_end": 1781730390.841065,
+      "wall_duration_ms": 1197.1027851104736,
+      "ttft_ms": 15.79591678455472,
+      "total_latency_ms": 1195.4870838671923,
+      "tokens_per_second": 41.82395667401,
+      "prompt_tokens": 98,
+      "generated_tokens": 50,
+      "gpu_memory_allocated_mb": 950.542724609375,
+      "gpu_memory_reserved_mb": 165.046875,
+      "generated_text": " The transformer architecture is a type of neural network that is commonly used in natural language processing (NLP) tasks. It is based on the idea of self-attention, which allows the model to learn long-range dependencies in sequences without recurrence. The key"
+    },
+    {
+      "request_index": 4,
+      "wall_start": 1781730390.841115,
+      "wall_end": 1781730392.021714,
+      "wall_duration_ms": 1180.5989742279053,
+      "ttft_ms": 16.103915870189667,
+      "total_latency_ms": 1179.0780001319945,
+      "tokens_per_second": 42.40601554299431,
+      "prompt_tokens": 98,
+      "generated_tokens": 50,
+      "gpu_memory_allocated_mb": 950.542724609375,
+      "gpu_memory_reserved_mb": 167.28125,
+      "generated_text": " The transformer architecture is a type of neural network that is commonly used in natural language processing (NLP) tasks. It is based on the idea of self-attention, which allows the model to learn long-range dependencies in sequences without recurrence. The key"
+    },
+    {
+      "request_index": 5,
+      "wall_start": 1781730392.021767,
+      "wall_end": 1781730393.203077,
+      "wall_duration_ms": 1181.3101768493652,
+      "ttft_ms": 16.066458076238632,
+      "total_latency_ms": 1179.721166845411,
+      "tokens_per_second": 42.38289640398724,
+      "prompt_tokens": 98,
+      "generated_tokens": 50,
+      "gpu_memory_allocated_mb": 950.542724609375,
+      "gpu_memory_reserved_mb": 169.65625,
+      "generated_text": " The transformer architecture is a type of neural network that is commonly used in natural language processing (NLP) tasks. It is based on the idea of self-attention, which allows the model to learn long-range dependencies in sequences without recurrence. The key"
+    }
+  ]
+}
