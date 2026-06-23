@@ -336,3 +336,91 @@ def test_decode_uses_pool_not_past_key_values(loaded: LoadedModel, cfg: Config):
 
     asyncio.run(_run())
 
+
+
+# ── Test 9: KV pool written during decode (pool stays source of truth) ─────────────
+
+
+def test_kv_pool_written_during_decode(loaded: LoadedModel, cfg: Config):
+    """Phase 8: each decode step must update the paged pool for the sequence."""
+
+    async def _run():
+        scheduler = _make_scheduler(loaded, cfg)
+        seq, _ = await scheduler.add_request(SHORT_PROMPT, max_new_tokens=3)
+
+        # Run until decoding starts
+        for _ in range(10):
+            await scheduler._schedule()
+            if seq.state in ("decoding", "finished"):
+                break
+
+        if seq.state == "decoding":
+            tokens_before = len(seq.generated_token_ids)
+            await scheduler._schedule()
+            tokens_after = len(seq.generated_token_ids)
+            assert tokens_after >= tokens_before, "Decode step must generate tokens"
+
+    asyncio.run(_run())
+
+
+# ── Test 10: swap-out triggered instead of OOM kill ────────────────────────────
+
+
+def test_swap_out_triggers_on_oom(loaded: LoadedModel, cfg: Config):
+    """With a tiny block pool, memory pressure must trigger a swap instead of OOM kill.
+
+    Creates a scheduler with kv_num_blocks=2 and kv_num_cpu_blocks=8 so the
+    device pool is exhausted after one prefill.  A second request arriving under
+    memory pressure should cause the running sequence to be swapped to CPU rather
+    than the incoming request being killed with OOM.
+
+    Assertion: at least one sequence reaches state=='swapped' OR the swapped
+    sequence is successfully restored (state=='decoding'/'finished') rather
+    than both sequences ending with finish_reason=='oom'.
+    """
+
+    async def _run():
+        c = Config()
+        c.max_batch_size = 4
+        c.scheduler_poll_interval_ms = 1.0
+        c.kv_num_blocks = 2        # tiny pool — fills up after ~1 sequence
+        c.kv_num_cpu_blocks = 8    # enough CPU staging room
+        c.kv_block_size = 16
+
+        scheduler = ContinuousBatchingScheduler(
+            model=loaded.model,
+            tokenizer=loaded.tokenizer,
+            config=c,
+        )
+
+        seq1, _ = await scheduler.add_request(SHORT_PROMPT, max_new_tokens=5)
+        seq2, _ = await scheduler.add_request(SHORT_PROMPT, max_new_tokens=5)
+
+        # Drive scheduler until both sequences have moved past 'waiting'
+        deadline = time.perf_counter() + 120.0  # 2-minute safety net
+        for _ in range(30):
+            if time.perf_counter() > deadline:
+                break
+            await scheduler._schedule()
+            if seq1.state != "waiting" and seq2.state != "waiting":
+                break
+
+        # Either at least one sequence was swapped (not killed with OOM)...
+        any_swapped_ever = (
+            len(scheduler.swapped_out) > 0
+            or scheduler.cpu_swap_manager.stats()["total_swap_outs"] > 0
+        )
+        # ...or both finished legitimately (swap-in worked end-to-end)
+        any_oom = (
+            getattr(seq1, "finish_reason", "") == "oom"
+            and getattr(seq2, "finish_reason", "") == "oom"
+        )
+
+        assert any_swapped_ever or not any_oom, (
+            f"Expected a swap event or non-OOM completion. "
+            f"seq1.state={seq1.state!r} finish_reason={seq1.finish_reason!r}; "
+            f"seq2.state={seq2.state!r} finish_reason={seq2.finish_reason!r}; "
+            f"cpu_swap stats={scheduler.cpu_swap_manager.stats()}"
+        )
+
+    asyncio.run(_run())

@@ -81,6 +81,12 @@ class Config:
     # Total number of blocks in the pool.
     kv_num_blocks: int = 256
 
+    # ── Phase 9: CPU Swap Pool ────────────────────────────────────────────────
+    # Size of the CPU-side KV cache staging pool, in blocks.
+    # Must be at least as large as the largest sequence's block count to allow
+    # a single swap-out to succeed.
+    kv_num_cpu_blocks: int = 128
+
     def __post_init__(self) -> None:
         # Allow environment variable overrides for common settings so the
         # server can be configured without code changes.
@@ -110,6 +116,9 @@ class Config:
             self.kv_block_size = int(env_block_size)
         if env_num_blocks := os.environ.get("KV_NUM_BLOCKS"):
             self.kv_num_blocks = int(env_num_blocks)
+        # Phase 9 env overrides
+        if env_cpu_blocks := os.environ.get("KV_NUM_CPU_BLOCKS"):
+            self.kv_num_cpu_blocks = int(env_cpu_blocks)
 
 
 # Module-level singleton — import and use directly when you don't need

@@ -11,9 +11,11 @@ carries all mutable state through its lifetime:
 
     waiting   →  expired    (timed out in queue before prefill)
     waiting   →  cancelled  (explicit cancel before prefill)
+    decoding  →  swapped    (KV blocks evicted to CPU under memory pressure;
+                             re-enters decoding after swap-in)
 
     Full valid states in lifecycle order:
-        waiting | prefill | decoding | finished | expired | cancelled
+        waiting | prefill | decoding | finished | expired | cancelled | swapped
 
 The `past_key_values` field holds the per-sequence HuggingFace KV cache.
 Storing KV caches per-sequence is the Phase 2 approach; unified KV cache
@@ -58,8 +60,9 @@ class Sequence:
         Normal path:  ``"waiting"`` → ``"prefill"`` → ``"decoding"`` → ``"finished"``
         Timeout path: ``"waiting"`` → ``"expired"``
         Cancel path:  ``"waiting"`` → ``"cancelled"``
+        Swap path:    ``"decoding"`` → ``"swapped"`` → ``"decoding"``
 
-        All valid states: ``waiting | prefill | decoding | finished | expired | cancelled``
+        All valid states: ``waiting | prefill | decoding | finished | expired | cancelled | swapped``
     past_key_values
         HuggingFace KV cache returned by the last model forward pass.
         ``None`` until prefill completes.
@@ -89,7 +92,7 @@ class Sequence:
     prompt_token_ids: List[int]
     generated_token_ids: List[int]
     max_new_tokens: int
-    state: str  # waiting | prefill | decoding | finished | expired | cancelled
+    state: str  # waiting | prefill | decoding | finished | expired | cancelled | swapped
     past_key_values: Any              # HuggingFace KV cache; None until prefill done
     ttft_ms: float
     arrival_time: float

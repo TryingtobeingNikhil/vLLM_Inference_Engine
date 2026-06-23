@@ -224,98 +224,26 @@ async def endpoint_generate(request: GenerateRequest):
 
 @app.get("/metrics", response_class=JSONResponse)
 async def endpoint_metrics():
-    """Return scheduler telemetry and per-sequence statistics.
+    """Return unified scheduler and system metrics via MetricsAggregator.
 
-    Response structure
-    ------------------
+    Response structure (Phase 10)
+    ------------------------------
     {
-        "scheduler": {
-            "batch_size_over_time":     [(timestamp, batch_size), ...],
-            "scheduler_step_latency_ms": [float, ...],
-            "running_count":            int,
-            "finished_count":           int,
-            "queue_depth":              int,
-        },
-        "sequences": [
-            {
-                "seq_id":               str,
-                "ttft_ms":              float,
-                "total_latency_ms":     float,
-                "tokens_per_second":    float,
-                "generated_tokens":     int,
-                "queue_wait_time_ms":   float,
-                "finish_reason":        str,
-            },
-            ...
-        ],
-        "summary": {
-            "count":            int,
-            "ttft_ms":          {"mean": float, "p50": ..., "p95": ..., "p99": ...},
-            "total_latency_ms": {...},
-            "tokens_per_second": {...},
-            "queue_wait_time_ms": {...},
-        }
+        "system":          SystemSnapshot (requests_in_flight, throughput, ...),
+        "e2e_latency":     {"ttft_ms": {p50/p95/p99}, "total_latency_ms": {...}},
+        "slo_compliance":  {"ttft_compliance_pct": float, ...},
+        "stage_breakdown": prefill/decode stage telemetry,
+        "kv_cache":        KV cache tracker stats,
+        "paged_kv_cache":  paged pool stats,
+        "cpu_swap":        CPU swap manager stats,
+        "queue_stats":     request queue stats,
     }
     """
     if _scheduler is None:
         raise HTTPException(status_code=503, detail="Scheduler not ready")
 
-    import numpy as np
+    return JSONResponse(content=_scheduler.get_metrics())
 
-    finished = list(_scheduler.finished)
-
-    # Per-sequence stats (lightweight — no generated text)
-    seq_stats = []
-    for seq in finished:
-        total_latency_ms = seq.ttft_ms + sum(seq.per_token_latencies_ms)
-        n_gen = len(seq.generated_token_ids)
-        tps = (n_gen / total_latency_ms * 1000.0) if total_latency_ms > 0 else 0.0
-        seq_stats.append({
-            "seq_id": seq.seq_id,
-            "ttft_ms": seq.ttft_ms,
-            "total_latency_ms": total_latency_ms,
-            "tokens_per_second": tps,
-            "generated_tokens": n_gen,
-            "queue_wait_time_ms": seq.queue_wait_time_ms,
-            "finish_reason": seq.finish_reason,
-        })
-
-    # Summary statistics
-    def _pcts(values: list) -> dict:
-        if not values:
-            return {}
-        arr = np.array(values, dtype=float)
-        return {
-            "mean": float(np.mean(arr)),
-            "p50":  float(np.percentile(arr, 50)),
-            "p95":  float(np.percentile(arr, 95)),
-            "p99":  float(np.percentile(arr, 99)),
-            "min":  float(np.min(arr)),
-            "max":  float(np.max(arr)),
-        }
-
-    summary: dict = {"count": len(finished)}
-    if finished:
-        summary["ttft_ms"] = _pcts([s["ttft_ms"] for s in seq_stats])
-        summary["total_latency_ms"] = _pcts([s["total_latency_ms"] for s in seq_stats])
-        summary["tokens_per_second"] = _pcts([s["tokens_per_second"] for s in seq_stats])
-        summary["queue_wait_time_ms"] = _pcts([s["queue_wait_time_ms"] for s in seq_stats])
-
-    return JSONResponse(content={
-        "scheduler": {
-            "batch_size_over_time": _scheduler.batch_size_over_time,
-            "scheduler_step_latency_ms": _scheduler.scheduler_step_latency_ms,
-            "running_count": len(_scheduler.running),
-            "finished_count": len(_scheduler.finished),
-            "queue_depth": _scheduler.request_queue.stats()["queue_depth"],
-        },
-        "queue_stats": _scheduler.request_queue.stats(),
-        "stage_breakdown": _scheduler.stage_tracker.full_report(),
-        "kv_cache": _scheduler.kv_tracker.stats(),
-        "paged_kv_cache": _scheduler.paged_kv_cache.stats(),
-        "sequences": seq_stats,
-        "summary": summary,
-    })
 
 
 @app.get("/health", response_class=JSONResponse)

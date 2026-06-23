@@ -62,17 +62,20 @@ from transformers import PreTrainedModel, PreTrainedTokenizerBase
 from inference_engine.config import Config
 from inference_engine.engine.attention_wrapper import build_past_key_values, extract_new_token_kv
 from inference_engine.engine.block_allocator import BlockAllocator, OutOfBlocksError
+from inference_engine.engine.cpu_swap_manager import CPUSwapManager, CPUSwapError
 from inference_engine.engine.kv_cache_config import (
     compute_kv_cache_config,
     format_kv_cache_report,
 )
 from inference_engine.engine.kv_cache_tracker import KVCacheTracker
+from inference_engine.engine.metrics_aggregator import MetricsAggregator
 from inference_engine.engine.paged_kv_cache import PagedKVCacheManager
 from inference_engine.engine.prefill_utils import run_prefill_single
 from inference_engine.engine.request_queue import RequestQueue
 from inference_engine.engine.sequence import Sequence
 from inference_engine.engine.stage_tracker import StageTracker
 from inference_engine.engine.sequential import get_memory_stats
+from inference_engine.metrics.collector import MetricsCollector
 
 logger = logging.getLogger(__name__)
 
@@ -137,6 +140,7 @@ class ContinuousBatchingScheduler:
         model: PreTrainedModel,
         tokenizer: PreTrainedTokenizerBase,
         config: Config,
+        metrics_collector: Optional[MetricsCollector] = None,
     ) -> None:
         self.model = model
         self.tokenizer = tokenizer
@@ -172,6 +176,13 @@ class ContinuousBatchingScheduler:
             f"({kv_stats['num_blocks']} blocks \u00d7 {kv_stats['block_size']} tokens)"
         )
 
+        # Phase 9: CPU staging pool for GPU ⇔ CPU swapping
+        self.cpu_swap_manager = CPUSwapManager(
+            kv_cache_config=self.kv_cache_config,
+            block_size=config.kv_block_size,
+            num_cpu_blocks=config.kv_num_cpu_blocks,
+        )
+
         self.max_batch_size: int = config.max_batch_size
         self.prefill_budget_tokens: int = config.prefill_budget_tokens
         self.decode_batch_limit: int = config.decode_batch_limit
@@ -187,6 +198,26 @@ class ContinuousBatchingScheduler:
         )
         self.running: List[Sequence] = []      # currently active sequences
         self.finished: List[Sequence] = []     # completed sequences
+        self.swapped_out: List[Sequence] = []  # Phase 9: sequences swapped to CPU
+
+        # Phase 10: Unified metrics aggregator
+        # If no MetricsCollector is provided by the server layer, create a
+        # local one so the aggregator always has something to read from.
+        if metrics_collector is None:
+            metrics_collector = MetricsCollector(
+                history_size=getattr(config, "metrics_history_size", 100)
+            )
+        self._metrics_collector = metrics_collector
+        self.metrics_aggregator = MetricsAggregator(
+            metrics_collector=self._metrics_collector,
+            stage_tracker=self.stage_tracker,
+            kv_tracker=self.kv_tracker,
+            block_allocator=self.block_allocator,
+            paged_kv_cache=self.paged_kv_cache,
+            cpu_swap_manager=self.cpu_swap_manager,
+            request_queue=self.request_queue,
+            history_window_seconds=60.0,
+        )
 
         # Control
         self._stop_event: asyncio.Event = asyncio.Event()
@@ -300,9 +331,28 @@ class ContinuousBatchingScheduler:
                 self.block_allocator._blocks[block_ids[-1]].tokens_used = self.config.kv_block_size
                 self.block_allocator._blocks[block_ids[-1]].is_dirty = True
         except OutOfBlocksError:
-            seq.state = "finished"
-            seq.finish_reason = "oom"
-            return
+            # Phase 9: instead of killing the sequence, try to swap out the
+            # largest running sequence to free device blocks, then retry.
+            swapped_ok = self._try_swap_out_victim()
+            if not swapped_ok:
+                seq.state = "finished"
+                seq.finish_reason = "oom"
+                return
+            # Retry allocation once after swap-out freed some blocks
+            try:
+                block_ids = self.block_allocator.allocate(seq.seq_id, blocks_needed)
+                # Mark tokens_used in the last block
+                tokens_in_last_block = prompt_token_count % self.config.kv_block_size
+                if tokens_in_last_block > 0:
+                    self.block_allocator._blocks[block_ids[-1]].tokens_used = tokens_in_last_block
+                    self.block_allocator._blocks[block_ids[-1]].is_dirty = True
+                else:
+                    self.block_allocator._blocks[block_ids[-1]].tokens_used = self.config.kv_block_size
+                    self.block_allocator._blocks[block_ids[-1]].is_dirty = True
+            except OutOfBlocksError:
+                seq.state = "finished"
+                seq.finish_reason = "oom"
+                return
 
         # Phase 7: write prompt KV tensors into paged pool
         # HuggingFace past_key_values may be a tuple-of-tuples (legacy) or
@@ -412,6 +462,9 @@ class ContinuousBatchingScheduler:
             memory_mb=self.kv_tracker.sequence_memory_mb(seq.seq_id),
         )
 
+        # Phase 10: record token throughput for aggregated metrics
+        self.metrics_aggregator.record_token_generated(1)
+
         # Record per-token latency
         step_ms = (time.perf_counter() - t_step) * 1000.0
         seq.per_token_latencies_ms.append(step_ms)
@@ -462,16 +515,93 @@ class ContinuousBatchingScheduler:
         future = self._futures.get(seq.seq_id)
         if future is not None and not future.done():
             future.set_result(seq)
+        # Phase 10: record completion for throughput and SLO tracking
+        self.metrics_aggregator.record_request_finished(seq.finish_reason)
         # Phase 7: zero paged pool slots before releasing blocks
         self.paged_kv_cache.clear_sequence(seq.seq_id)
         # Phase 6: release block allocator memory for this sequence
         self.block_allocator.free(seq.seq_id)
+
+    # ── Internal: Phase 9 swap helpers ────────────────────────────────────────
+
+    def _try_swap_out_victim(self) -> bool:
+        """Find the largest running sequence and swap its KV blocks to CPU.
+
+        Selection policy: largest by block count (most device memory freed per
+        swap) rather than LRU.  Freeing one large sequence is more efficient
+        than several small ones.
+
+        Returns
+        -------
+        bool
+            True if a victim was successfully swapped out; False if no
+            candidates exist or the CPU pool is full.
+        """
+        if not self.running:
+            return False
+
+        # Pick the sequence holding the most device blocks
+        victim = max(
+            self.running,
+            key=lambda s: self.block_allocator.num_blocks_for_seq(s.seq_id),
+        )
+
+        device_block_ids = self.block_allocator.get_blocks(victim.seq_id)
+        if not device_block_ids:
+            # Nothing to swap — sequence holds no blocks yet
+            return False
+
+        try:
+            self.cpu_swap_manager.swap_out(
+                victim.seq_id,
+                device_block_ids,
+                self.paged_kv_cache,
+                self.block_allocator,
+            )
+        except CPUSwapError:
+            return False
+
+        # Transition victim to 'swapped' state and move it out of running
+        victim.state = "swapped"
+        self.running.remove(victim)
+        self.swapped_out.append(victim)
+        logger.debug(
+            "Swapped out seq_id=%s (%d blocks) to CPU",
+            victim.seq_id,
+            len(device_block_ids),
+        )
+        return True
 
     # ── Internal: scheduler step ──────────────────────────────────────────────
 
     async def _schedule(self) -> None:
         """Run the prefill stage, then one decode pass over active sequences."""
         step_start = time.perf_counter()
+
+        # --- Phase 9: Swap-in check ---
+        # Before admitting new sequences, try to restore any swapped-out
+        # sequences if the device pool now has enough room.
+        for victim in list(self.swapped_out):
+            swap_record = self.cpu_swap_manager._swapped.get(victim.seq_id)
+            if swap_record is None:
+                # Already cleaned up — remove from list
+                self.swapped_out.remove(victim)
+                continue
+            if self.block_allocator.num_free_blocks() >= swap_record.original_num_blocks:
+                try:
+                    self.cpu_swap_manager.swap_in(
+                        victim.seq_id,
+                        self.paged_kv_cache,
+                        self.block_allocator,
+                    )
+                    victim.state = "decoding"
+                    self.swapped_out.remove(victim)
+                    self.running.append(victim)
+                    logger.debug(
+                        "Swapped in seq_id=%s back to decoding", victim.seq_id
+                    )
+                except OutOfBlocksError:
+                    continue  # still not enough room, try next iteration
 
         # --- Stage 1: Prefill ---
         prefill_start = time.perf_counter()
@@ -571,3 +701,17 @@ class ContinuousBatchingScheduler:
                 self._loop_task.cancel()
         self._executor.shutdown(wait=False)
         logger.info("Scheduler stopped. Finished %d sequences.", len(self.finished))
+
+    # ── Public metrics API (Phase 10) ─────────────────────────────────────────
+
+    def get_metrics(self) -> dict:
+        """Return a single unified metrics dict via MetricsAggregator.
+
+        This is the ONLY method the server layer should call for metrics.
+        All tracker stats, derived throughput, SLO compliance, and latency
+        percentiles are assembled inside MetricsAggregator.full_report().
+        """
+        return self.metrics_aggregator.full_report(
+            requests_in_flight=len(self.running),
+            requests_waiting=len(self.request_queue),
+        )
