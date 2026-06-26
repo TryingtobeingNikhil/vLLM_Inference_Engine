@@ -244,13 +244,20 @@ def test_batch_size_never_exceeds_max(loaded: LoadedModel, cfg: Config):
     asyncio.run(_run())
 
 
-# ── Test 6: prefill token budget blocks oversized prompts ────────────────────
+# ── Test 6: prefill chunk budget defers processing of over-budget prompts ────
 
 
 def test_prefill_budget_respected(loaded: LoadedModel, cfg: Config):
+    """With chunked prefill, sequences are always admitted to self.running, but
+    the Stage-2 chunk-processing loop respects prefill_budget_tokens.
+
+    A 20-token prompt with chunk_size=128 means the chunk is 20 tokens.
+    With budget=10 (< 20), that chunk is skipped this step: the sequence stays
+    in running with state "chunked_prefilling" and prefill_offset == 0.
+    """
     async def _run():
         scheduler = _make_scheduler(loaded, cfg)
-        scheduler.prefill_budget_tokens = 10
+        scheduler.prefill_budget_tokens = 10   # tighter than chunk size
         seq = Sequence.create(
             prompt="oversized prompt",
             prompt_token_ids=list(range(20)),
@@ -260,9 +267,11 @@ def test_prefill_budget_respected(loaded: LoadedModel, cfg: Config):
 
         await scheduler._schedule()
 
-        assert seq not in scheduler.running
-        assert len(scheduler.request_queue) == 1
-        assert scheduler.request_queue._queue[0].sequence is seq
+        # Sequence is admitted to running (new behaviour)
+        assert seq in scheduler.running
+        # But no forward pass ran — offset is still at the start
+        assert seq.prefill_offset == 0
+        assert seq.state == "chunked_prefilling"
 
     asyncio.run(_run())
 

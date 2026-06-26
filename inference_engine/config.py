@@ -71,6 +71,11 @@ class Config:
     prefill_budget_tokens: int = 512
     # Maximum number of sequences resident in the decode stage.
     decode_batch_limit: int = 8
+    # Number of prompt tokens processed per scheduler step during chunked
+    # prefill.  Smaller values give more decode interleaving (lower P99 for
+    # concurrent short requests) at the cost of more forward passes per long
+    # prompt.  Must be >= 1.
+    prefill_chunk_size: int = 128
 
     # ── Phase 5: KV Cache Tracking ────────────────────────────────────────────
     kv_cache_max_memory_mb: float = 1024.0
@@ -109,6 +114,8 @@ class Config:
             self.prefill_budget_tokens = int(env_prefill_budget)
         if env_decode_limit := os.environ.get("DECODE_BATCH_LIMIT"):
             self.decode_batch_limit = int(env_decode_limit)
+        if env_chunk := os.environ.get("PREFILL_CHUNK_SIZE"):
+            self.prefill_chunk_size = int(env_chunk)
         if env_kv_memory := os.environ.get("KV_CACHE_MAX_MEMORY_MB"):
             self.kv_cache_max_memory_mb = float(env_kv_memory)
         # Phase 6 env overrides

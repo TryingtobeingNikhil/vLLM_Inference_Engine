@@ -378,6 +378,151 @@ class ContinuousBatchingScheduler:
             first_token_id,
         )
 
+    # ── Internal: chunked prefill ──────────────────────────────────────────────
+
+    def _prefill_chunk_blocking(self, seq: Sequence) -> None:
+        """Run ONE chunk of the prefill pass for *seq*.
+
+        This is the core of the chunked-prefill feature.  Instead of processing
+        the full prompt in a single blocking forward pass (which delays decode
+        for all other sequences), we advance by at most ``seq.prefill_chunk_size``
+        tokens per scheduler step, then yield back to the event loop so other
+        sequences can decode.
+
+        Chunk logic
+        -----------
+        - First chunk  (seq.prefill_offset == 0): cold forward pass, no prior KV.
+        - Middle chunks: reconstruct accumulated KV from the paged pool, then
+          run a forward pass over the next slice of prompt tokens.
+        - Final chunk  (offset+chunk reaches end of prompt): same as middle, but
+          additionally samples the first output token and transitions to decoding.
+
+        After each chunk:
+        - New KV tensors are written into the paged pool.
+        - Block-allocator token accounting is updated.
+        - ``seq.prefill_offset`` is advanced.
+
+        This is a BLOCKING function intended to run inside the shared executor.
+        """
+        import math
+
+        t_chunk_start = time.perf_counter()
+
+        prompt_ids = seq.prompt_token_ids
+        prompt_len = len(prompt_ids)
+        chunk_start = seq.prefill_offset
+        chunk_end = min(chunk_start + seq.prefill_chunk_size, prompt_len)
+        chunk_ids = prompt_ids[chunk_start:chunk_end]
+        chunk_len = len(chunk_ids)
+        is_first_chunk = chunk_start == 0
+        is_last_chunk = chunk_end >= prompt_len
+
+        # ── Record queue wait and start time on the first chunk ───────────────
+        if is_first_chunk:
+            seq.queue_wait_time_ms = (t_chunk_start - seq.arrival_time) * 1000.0
+            seq.prefill_start_time = t_chunk_start
+            seq.state = "chunked_prefilling"
+
+            # Allocate blocks for the full prompt upfront (same as full prefill)
+            blocks_needed = math.ceil(prompt_len / self.config.kv_block_size)
+            try:
+                block_ids = self.block_allocator.allocate(seq.seq_id, blocks_needed)
+                tokens_in_last_block = prompt_len % self.config.kv_block_size
+                last_fill = tokens_in_last_block if tokens_in_last_block > 0 else self.config.kv_block_size
+                self.block_allocator._blocks[block_ids[-1]].tokens_used = last_fill
+                self.block_allocator._blocks[block_ids[-1]].is_dirty = True
+            except OutOfBlocksError:
+                swapped_ok = self._try_swap_out_victim()
+                if not swapped_ok:
+                    seq.state = "finished"
+                    seq.finish_reason = "oom"
+                    return
+                try:
+                    block_ids = self.block_allocator.allocate(seq.seq_id, blocks_needed)
+                    tokens_in_last_block = prompt_len % self.config.kv_block_size
+                    last_fill = tokens_in_last_block if tokens_in_last_block > 0 else self.config.kv_block_size
+                    self.block_allocator._blocks[block_ids[-1]].tokens_used = last_fill
+                    self.block_allocator._blocks[block_ids[-1]].is_dirty = True
+                except OutOfBlocksError:
+                    seq.state = "finished"
+                    seq.finish_reason = "oom"
+                    return
+
+            # Register with KV tracker using prompt length
+            self.kv_tracker.register_sequence(seq.seq_id, prompt_len)
+
+        # ── Build past_key_values from paged pool (empty on first chunk) ──────
+        if is_first_chunk:
+            past_kv = None
+        else:
+            past_kv = build_past_key_values(
+                seq_id=seq.seq_id,
+                paged_kv_cache=self.paged_kv_cache,
+                num_layers=self.kv_cache_config.num_layers,
+                device=str(self._device),
+                use_dynamic_cache=True,
+            )
+
+        # ── Forward pass over this chunk ──────────────────────────────────────
+        input_ids = torch.tensor([chunk_ids], dtype=torch.long, device=self._device)
+        with torch.no_grad():
+            outputs = self.model(
+                input_ids=input_ids,
+                past_key_values=past_kv,
+                use_cache=True,
+            )
+
+        new_past_kv = outputs.past_key_values
+
+        # ── Write new chunk KV into paged pool ────────────────────────────────
+        # token_position is the global index within the full prompt.
+        for token_pos_in_chunk in range(chunk_len):
+            global_pos = chunk_start + token_pos_in_chunk
+            for layer_idx in range(self.kv_cache_config.num_layers):
+                layer_key, layer_val = _extract_kv_layer(new_past_kv, layer_idx)
+                # layer_key shape: [1, num_kv_heads, total_tokens_so_far, head_dim]
+                # We need the column corresponding to this specific prompt token.
+                # The output KV spans [prior_kv_len .. prior_kv_len + chunk_len].
+                # token_pos_in_chunk maps to that column.
+                key_slice = layer_key[0, :, token_pos_in_chunk, :]
+                val_slice = layer_val[0, :, token_pos_in_chunk, :]
+                self.paged_kv_cache.write_kv(
+                    seq.seq_id, layer_idx, global_pos, key_slice, val_slice
+                )
+
+        # ── Advance offset ────────────────────────────────────────────────────
+        seq.prefill_offset = chunk_end
+
+        # ── If this was the last chunk, sample first token & transition ───────
+        if is_last_chunk:
+            logits = outputs.logits       # [1, chunk_len, vocab_size]
+            first_token_id = int(logits[:, -1, :].argmax(dim=-1).item())
+            seq.generated_token_ids.append(first_token_id)
+
+            seq.ttft_ms = (time.perf_counter() - seq.prefill_start_time) * 1000.0
+            seq.first_token_time = time.perf_counter()
+            seq.state = "decoding"
+            seq.update_kv_stats(
+                token_count=prompt_len,
+                memory_mb=self.kv_tracker.sequence_memory_mb(seq.seq_id),
+            )
+            logger.debug(
+                "Chunked prefill done: seq_id=%s chunks=%d ttft=%.1f ms first_token=%d",
+                seq.seq_id,
+                math.ceil(prompt_len / seq.prefill_chunk_size),
+                seq.ttft_ms,
+                first_token_id,
+            )
+        else:
+            logger.debug(
+                "Chunk %d-%d / %d done for seq_id=%s (%.1f ms)",
+                chunk_start,
+                chunk_end - 1,
+                prompt_len - 1,
+                seq.seq_id,
+                (time.perf_counter() - t_chunk_start) * 1000.0,
+            )
+
     # ── Internal: single decode step ──────────────────────────────────────────
 
     def _decode_one_step_blocking(self, seq: Sequence) -> None:
@@ -575,7 +720,30 @@ class ContinuousBatchingScheduler:
     # ── Internal: scheduler step ──────────────────────────────────────────────
 
     async def _schedule(self) -> None:
-        """Run the prefill stage, then one decode pass over active sequences."""
+        """Run prefill admission, chunked-prefill advancement, then one decode pass.
+
+        Scheduling order per step
+        -------------------------
+        0. Swap-in: restore any sequences whose KV blocks were evicted to CPU.
+        1. Admit: pull new sequences from the waiting queue into self.running,
+           stamping their prefill_chunk_size and setting state to
+           "chunked_prefilling".  No forward pass happens here.
+        2. Chunked prefill: for each "chunked_prefilling" sequence, run exactly
+           one chunk (≤ prefill_chunk_size tokens) via _prefill_chunk_blocking.
+           This is bounded by the prefill_budget_tokens cap so a very long
+           prompt cannot monopolise an entire step.  When the last chunk
+           finishes the sequence transitions to "decoding" automatically.
+        3. Decode: advance every "decoding" sequence by one token.
+        4. Eviction: move finished sequences out of self.running.
+
+        Why this order matters
+        ----------------------
+        By separating admission (Step 1) from the forward pass (Step 2), a
+        newly-admitted sequence sits in self.running immediately but only
+        processes chunk_size tokens before decode runs.  This bounds the
+        maximum delay experienced by already-decoding sequences to the cost of
+        one chunk forward pass rather than the full prompt forward pass.
+        """
         step_start = time.perf_counter()
 
         # --- Phase 9: Swap-in check ---
@@ -603,10 +771,11 @@ class ContinuousBatchingScheduler:
                 except OutOfBlocksError:
                     continue  # still not enough room, try next iteration
 
-        # --- Stage 1: Prefill ---
-        prefill_start = time.perf_counter()
-        tokens_this_iteration = 0
-        sequences_prefilled = 0
+        # --- Stage 1: Admit new sequences (no prefill forward pass here) ---
+        # Sequences are added to self.running with state "chunked_prefilling".
+        # The actual forward pass happens in Stage 2 below.
+        admit_start = time.perf_counter()
+        sequences_admitted = 0
         running_limit = min(self.max_batch_size, self.decode_batch_limit)
 
         while len(self.running) < running_limit:
@@ -614,18 +783,33 @@ class ContinuousBatchingScheduler:
             if queued is None:
                 break
             seq = queued.sequence
-            prompt_len = len(seq.prompt_token_ids)
-
-            if tokens_this_iteration + prompt_len > self.prefill_budget_tokens:
-                async with self.request_queue._lock:
-                    self.request_queue._queue.insert(0, queued)
-                break
-
-            tokens_this_iteration += prompt_len
-            await asyncio.to_thread(self._prefill_sequence, seq)
+            # Stamp the chunk size from config (frozen for this sequence's lifetime)
+            seq.prefill_chunk_size = self.config.prefill_chunk_size
+            seq.state = "chunked_prefilling"
             self.running.append(seq)
             self.request_queue._total_admitted += 1
-            sequences_prefilled += 1
+            sequences_admitted += 1
+
+        # --- Stage 2: Advance chunked prefill for in-progress sequences ---
+        prefill_start = time.perf_counter()
+        tokens_this_iteration = 0
+        sequences_prefilled = 0   # counts sequences that finished their last chunk
+
+        for seq in list(self.running):
+            if seq.state != "chunked_prefilling":
+                continue
+            # Respect the per-step token budget to avoid starving decode.
+            chunk_tokens = min(seq.prefill_chunk_size, len(seq.prompt_token_ids) - seq.prefill_offset)
+            if tokens_this_iteration + chunk_tokens > self.prefill_budget_tokens:
+                # Budget exhausted — this sequence will get its chunk next step.
+                break
+            tokens_this_iteration += chunk_tokens
+            await asyncio.to_thread(self._prefill_chunk_blocking, seq)
+            if seq.state == "decoding":
+                sequences_prefilled += 1  # last chunk completed
+            elif seq.state == "finished":
+                # OOM during chunk allocation — will be evicted in Stage 3
+                pass
 
         prefill_latency_ms = (time.perf_counter() - prefill_start) * 1000.0
         self.stage_tracker.record_prefill(
@@ -635,7 +819,7 @@ class ContinuousBatchingScheduler:
             budget_tokens=self.prefill_budget_tokens,
         )
 
-        # --- Stage 2: Decode ---
+        # --- Stage 3: Decode + eviction ---
         decode_start = time.perf_counter()
         sequences_decoded = 0
         still_running: List[Sequence] = []

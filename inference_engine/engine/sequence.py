@@ -9,13 +9,16 @@ carries all mutable state through its lifetime:
     waiting   →  prefill   →  decoding   →  finished
        ↑ created    ↑ admitted    ↑ first token    ↑ EOS or max_new_tokens
 
+    waiting   →  chunked_prefilling  →  decoding   →  finished
+       ↑ created    ↑ admitted (chunked)   ↑ all chunks done
+
     waiting   →  expired    (timed out in queue before prefill)
     waiting   →  cancelled  (explicit cancel before prefill)
     decoding  →  swapped    (KV blocks evicted to CPU under memory pressure;
                              re-enters decoding after swap-in)
 
     Full valid states in lifecycle order:
-        waiting | prefill | decoding | finished | expired | cancelled | swapped
+        waiting | prefill | chunked_prefilling | decoding | finished | expired | cancelled | swapped
 
 The `past_key_values` field holds the per-sequence HuggingFace KV cache.
 Storing KV caches per-sequence is the Phase 2 approach; unified KV cache
@@ -57,12 +60,14 @@ class Sequence:
         Lifecycle state.  Mutated exclusively by the scheduler or
         RequestQueue:
 
-        Normal path:  ``"waiting"`` → ``"prefill"`` → ``"decoding"`` → ``"finished"``
-        Timeout path: ``"waiting"`` → ``"expired"``
-        Cancel path:  ``"waiting"`` → ``"cancelled"``
-        Swap path:    ``"decoding"`` → ``"swapped"`` → ``"decoding"``
+        Normal path:   ``"waiting"`` → ``"prefill"`` → ``"decoding"`` → ``"finished"``
+        Chunked path:  ``"waiting"`` → ``"chunked_prefilling"`` → ``"decoding"`` → ``"finished"``
+        Timeout path:  ``"waiting"`` → ``"expired"``
+        Cancel path:   ``"waiting"`` → ``"cancelled"``
+        Swap path:     ``"decoding"`` → ``"swapped"`` → ``"decoding"``
 
-        All valid states: ``waiting | prefill | decoding | finished | expired | cancelled | swapped``
+        All valid states:
+            ``waiting | prefill | chunked_prefilling | decoding | finished | expired | cancelled | swapped``
     past_key_values
         HuggingFace KV cache returned by the last model forward pass.
         ``None`` until prefill completes.
@@ -85,6 +90,18 @@ class Sequence:
         Time (ms) from ``arrival_time`` to the moment prefill began.
         Set by the scheduler when the sequence is admitted from the waiting
         queue.  ``0.0`` until then.
+    prefill_offset
+        Number of prompt tokens already processed in chunked-prefill mode.
+        Starts at 0; advances by ``prefill_chunk_size`` each step; once it
+        reaches ``len(prompt_token_ids)`` the sequence transitions to
+        ``"decoding"``.  Unused in the legacy full-prefill path.
+    prefill_chunk_size
+        Tokens to process per scheduler step during chunked prefill.
+        Frozen at admission time from ``config.prefill_chunk_size``.
+    prefill_start_time
+        ``time.perf_counter()`` when the first chunk began.  Used to compute
+        TTFT across potentially multiple chunks.  ``0.0`` until the first
+        chunk starts.
     """
 
     seq_id: str
@@ -92,7 +109,7 @@ class Sequence:
     prompt_token_ids: List[int]
     generated_token_ids: List[int]
     max_new_tokens: int
-    state: str  # waiting | prefill | decoding | finished | expired | cancelled | swapped
+    state: str  # waiting | prefill | chunked_prefilling | decoding | finished | expired | cancelled | swapped
     past_key_values: Any              # HuggingFace KV cache; None until prefill done
     ttft_ms: float
     arrival_time: float
@@ -102,12 +119,19 @@ class Sequence:
     queue_wait_time_ms: float         # arrival → prefill start; set by scheduler
     kv_token_count: int = 0
     kv_memory_mb: float = 0.0
+    prefill_offset: int = 0           # tokens processed so far (chunked prefill)
+    prefill_chunk_size: int = 128     # frozen at admission from config
+    prefill_start_time: float = 0.0   # perf_counter() when first chunk started
 
     # ── Convenience helpers ───────────────────────────────────────────────────
 
     def is_finished(self) -> bool:
         """Return True when the sequence has reached terminal state."""
         return self.state == "finished"
+
+    def is_prefill_done(self) -> bool:
+        """Return True when all prompt tokens have been processed in chunked prefill."""
+        return self.prefill_offset >= len(self.prompt_token_ids)
 
     def total_tokens(self) -> int:
         """Total token count: prompt tokens + generated tokens so far."""
@@ -146,4 +170,7 @@ class Sequence:
             per_token_latencies_ms=[],
             finish_reason="",
             queue_wait_time_ms=0.0,
+            prefill_offset=0,
+            prefill_chunk_size=128,   # overwritten by scheduler at admission
+            prefill_start_time=0.0,
         )
