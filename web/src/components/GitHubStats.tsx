@@ -9,7 +9,7 @@ interface RepoStats {
 }
 
 const REPO = 'TryingtobeingNikhil/vLLM_Inference_Engine';
-const DURATION = 1200; // ms
+const DURATION = 2800; // ms
 
 /** Animates a number from 0 → target over DURATION ms with ease-out cubic */
 function useCountUp(target: number): number {
