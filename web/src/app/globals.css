@@ -1,0 +1,139 @@
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=Inter:wght@300;400;500;600;700&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg: #0a0a0a;
+  --surface: #111111;
+  --surface2: #181818;
+  --border: #2a2a2a;
+  --border-bright: #3a3a3a;
+  --text: #e8e8e8;
+  --text-dim: #666666;
+  --text-muted: #444444;
+  --accent-green: #4ade80;
+  --accent-green-dim: #1a3d27;
+  --accent-amber: #fbbf24;
+  --accent-amber-dim: #3d2e0a;
+  --accent-red: #f87171;
+  --accent-red-dim: #3d1a1a;
+  --accent-blue: #60a5fa;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  background-color: var(--bg);
+  color: var(--text);
+  font-family: 'Inter', system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  overflow-x: hidden;
+}
+
+/* ── Typography ─────────────────────────────────────────────────── */
+
+.font-mono {
+  font-family: 'JetBrains Mono', Consolas, monospace;
+}
+
+h1, h2, h3, h4 {
+  letter-spacing: -0.02em;
+}
+
+/* ── Cards & borders (strictly boxy — no radius anywhere) ────────── */
+
+* {
+  border-radius: 0 !important;
+}
+
+/* ── Scrollbar ───────────────────────────────────────────────────── */
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: var(--bg);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border);
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--border-bright);
+}
+
+/* ── Animations ──────────────────────────────────────────────────── */
+
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes slideRight {
+  from { width: 0%; }
+  to   { width: var(--target-width, 100%); }
+}
+
+@keyframes blockFill {
+  from { opacity: 0.1; }
+  to   { opacity: 1; }
+}
+
+.animate-blink { animation: blink 1s step-end infinite; }
+.animate-fade-in { animation: fadeIn 0.4s ease-out forwards; }
+
+/* ── State color helpers ─────────────────────────────────────────── */
+
+.state-waiting          { color: var(--text-dim); }
+.state-prefill          { color: var(--accent-amber); }
+.state-chunked-prefill  { color: var(--accent-amber); }
+.state-decoding         { color: var(--accent-green); }
+.state-swapped          { color: var(--accent-red); }
+.state-finished         { color: var(--text-muted); }
+
+.bg-state-waiting          { background-color: #1a1a1a; }
+.bg-state-prefill          { background-color: var(--accent-amber-dim); }
+.bg-state-decoding         { background-color: var(--accent-green-dim); }
+.bg-state-swapped          { background-color: var(--accent-red-dim); }
+
+/* ── Section dividers ────────────────────────────────────────────── */
+
+.section-divider {
+  border-top: 1px solid var(--border);
+  margin: 0;
+}
+
+/* ── Code blocks ─────────────────────────────────────────────────── */
+
+pre, code {
+  font-family: 'JetBrains Mono', Consolas, monospace;
+  font-size: 0.8rem;
+  line-height: 1.6;
+}
+
+/* ── Scrollable log panel ────────────────────────────────────────── */
+
+.log-panel {
+  overflow-y: auto;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.75rem;
+  line-height: 1.6;
+  color: var(--text-dim);
+}
+
+.log-panel::-webkit-scrollbar { width: 4px; }
+.log-panel::-webkit-scrollbar-thumb { background: #333; }

@@ -3,3 +3,9 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .DS_Store
+
+# Web frontend
+web/node_modules/
+web/.next/
+web/out/
+web/.env*.local

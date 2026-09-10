@@ -1,24 +1,24 @@
 {
   "single_request": {
-    "ttft_ms_mean": 19.79712478350848,
-    "total_latency_ms_mean": 620.0793439056724,
-    "tps_mean": 80.84512699897603
+    "ttft_ms_mean": 16.523948004760314,
+    "total_latency_ms_mean": 514.3687274903641,
+    "tps_mean": 97.25030647950244
   },
   "concurrent": {
     "n_requests": 4,
     "max_tokens": 50,
-    "wall_ms": 4285.023999866098,
+    "wall_ms": 3990.446416020859,
     "phase1_expected_ms": 5673.6,
-    "speedup": 1.3240532608865887,
-    "aggregate_tps": 46.6741843234133,
+    "speedup": 1.4217958114214013,
+    "aggregate_tps": 50.119705704364115,
     "total_tokens": 200,
     "ttft_ms": {
-      "mean": 13.721250114031136,
-      "min": 13.389541767537594,
-      "max": 14.177375007420778
+      "mean": 52.92193701461656,
+      "min": 21.879041014472023,
+      "max": 83.6971250246279
     },
     "total_latency_ms": {
-      "mean": 624.7106119990349
+      "mean": 541.4330737912678
     }
   }
 }
