@@ -2,6 +2,7 @@
 
 import { useSchedulerSim } from '@/lib/useSchedulerSim';
 import { Badge } from '@/components/ui/Badge';
+import { GitHubStats } from '@/components/GitHubStats';
 import type { SimSequence, SeqState } from '@/data/simulation';
 
 const STATE_LABELS: Record<SeqState, string> = {
@@ -125,6 +126,9 @@ export function HeroSection() {
               {tag}
             </span>
           ))}
+          <span className="border-l border-[#2a2a2a] pl-3">
+            <GitHubStats />
+          </span>
         </div>
 
         {/* ── Scheduler panel ────────────────────────────────────── */}

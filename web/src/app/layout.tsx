@@ -5,16 +5,23 @@ export const metadata: Metadata = {
   title: 'PageServe — LLM Inference Engine',
   description:
     'A production-grade LLM inference engine built from first principles: continuous batching, paged KV cache, chunked prefill, and CPU swap pool.',
+  icons: {
+    icon: '/favicon.png',
+    shortcut: '/favicon.png',
+    apple: '/favicon.png',
+  },
   openGraph: {
     title: 'PageServe — LLM Inference Engine',
     description:
       'Continuous batching, paged KV cache, chunked prefill — built without vLLM or HuggingFace generate.',
     type: 'website',
+    images: ['/favicon.png'],
   },
   twitter: {
     card: 'summary',
     title: 'PageServe',
     description: 'LLM inference engine built from first principles.',
+    images: ['/favicon.png'],
   },
 };
 

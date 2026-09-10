@@ -1,3 +1,5 @@
+import { GitHubStats } from '@/components/GitHubStats';
+
 export function GitHubFooter() {
   const REPO_URL = 'https://github.com/TryingtobeingNikhil/vLLM_Inference_Engine';
 
@@ -53,7 +55,7 @@ export function GitHubFooter() {
           </div>
 
           {/* Right — CTA */}
-          <div className="flex flex-col items-start gap-2 sm:items-end">
+          <div className="flex flex-col items-start gap-3 sm:items-end">
             <a
               href={REPO_URL}
               target="_blank"
@@ -71,6 +73,7 @@ export function GitHubFooter() {
               </svg>
               View on GitHub
             </a>
+            <GitHubStats />
             <span className="font-mono text-[10px] text-[#333333]">
               TryingtobeingNikhil / vLLM_Inference_Engine
             </span>
