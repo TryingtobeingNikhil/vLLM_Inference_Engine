@@ -55,16 +55,6 @@ const LOOP_STEPS = [
   },
 ];
 
-const ARCHITECTURE_NODES = [
-  { id: 'req',       label: 'Request',         x: 5,   y: 42, w: 80 },
-  { id: 'queue',     label: 'RequestQueue',     x: 110, y: 30, w: 110 },
-  { id: 'scheduler', label: 'Scheduler Loop',   x: 255, y: 30, w: 110 },
-  { id: 'prefill',   label: 'Prefill Stage',    x: 400, y: 5,  w: 100 },
-  { id: 'decode',    label: 'Decode Stage',     x: 400, y: 55, w: 100 },
-  { id: 'kvcache',   label: 'PagedKVCache',     x: 535, y: 30, w: 100 },
-  { id: 'swap',      label: 'CPUSwapPool',      x: 535, y: 75, w: 100 },
-];
-
 export function SchedulerLiveSection() {
   return (
     <section id="scheduler" className="border-b border-[#1e1e1e] px-6 py-20 sm:px-10 lg:px-16">
@@ -110,88 +100,79 @@ export function SchedulerLiveSection() {
             System Architecture
           </p>
           <div className="overflow-x-auto">
+            {/*
+              Layout (all y values are tops of 24-tall boxes):
+                Request       x=8,   y=44  → center=(52,  56)
+                RequestQueue  x=118, y=32  → center=(177, 44)
+                SchedulerLoop x=268, y=32  → center=(327, 44)
+                PrefillStage  x=420, y=6   → center=(476, 18)
+                DecodeStage   x=420, y=62  → center=(476, 74)
+                PagedKVCache  x=566, y=32  → center=(622, 44)
+                CPUSwapPool   x=566, y=82  → center=(622, 94) bottom=106
+
+              swap_out: vertical line 622,56 → 622,80   label at x=634 y=70
+              swap_in:  cubic bezier M566,94 C518,94 518,44 566,44  label at x=500 y=72
+              Total height needed: 106 + 10 padding = 116 → viewBox height = 125
+            */}
             <svg
-              viewBox="0 0 820 140"
+              viewBox="0 0 820 125"
               className="w-full min-w-[640px]"
               style={{ fontFamily: 'JetBrains Mono, monospace' }}
             >
               <defs>
-                <marker id="arrow"       markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto">
-                  <path d="M0,0 L6,3 L0,6 Z" fill="#444" />
-                </marker>
-                <marker id="arrow-amber" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto">
-                  <path d="M0,0 L6,3 L0,6 Z" fill="#FBBF24" />
-                </marker>
-                <marker id="arrow-green" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto">
-                  <path d="M0,0 L6,3 L0,6 Z" fill="#4ADE80" />
-                </marker>
-                <marker id="arrow-red"   markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto">
-                  <path d="M0,0 L6,3 L0,6 Z" fill="#F87171" />
-                </marker>
+                <marker id="arr"       markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#444" /></marker>
+                <marker id="arr-amber" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#FBBF24" /></marker>
+                <marker id="arr-green" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#4ADE80" /></marker>
+                <marker id="arr-red"   markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#F87171" /></marker>
               </defs>
 
-              {/* ── Nodes ─────────────────────────────────────────── */}
-              {/* Request */}
-              <rect x="8"   y="46" width="88"  height="24" fill="#1a1a1a" stroke="#2a2a2a" strokeWidth="1" />
-              <text x="52"  y="62" fill="#888" fontSize="9" textAnchor="middle">Request</text>
+              {/* ── Nodes ── */}
+              <rect x="8"   y="44" width="88"  height="24" fill="#1a1a1a" stroke="#2a2a2a" strokeWidth="1" />
+              <text x="52"  y="60" fill="#888" fontSize="9" textAnchor="middle">Request</text>
 
-              {/* RequestQueue */}
-              <rect x="118" y="34" width="118" height="24" fill="#1a1a1a" stroke="#2a2a2a" strokeWidth="1" />
-              <text x="177" y="50" fill="#888" fontSize="9" textAnchor="middle">RequestQueue</text>
+              <rect x="118" y="32" width="118" height="24" fill="#1a1a1a" stroke="#2a2a2a" strokeWidth="1" />
+              <text x="177" y="48" fill="#888" fontSize="9" textAnchor="middle">RequestQueue</text>
 
-              {/* Scheduler Loop */}
-              <rect x="268" y="34" width="118" height="24" fill="#1a1a1a" stroke="#2a2a2a" strokeWidth="1" />
-              <text x="327" y="50" fill="#888" fontSize="9" textAnchor="middle">Scheduler Loop</text>
+              <rect x="268" y="32" width="118" height="24" fill="#1a1a1a" stroke="#2a2a2a" strokeWidth="1" />
+              <text x="327" y="48" fill="#888" fontSize="9" textAnchor="middle">Scheduler Loop</text>
 
-              {/* Prefill Stage */}
-              <rect x="420" y="8"  width="112" height="24" fill="#3d2e0a" stroke="#FBBF24" strokeWidth="1" />
-              <text x="476" y="24" fill="#FBBF24" fontSize="9" textAnchor="middle">Prefill Stage</text>
+              <rect x="420" y="6"  width="112" height="24" fill="#3d2e0a" stroke="#FBBF24" strokeWidth="1" />
+              <text x="476" y="22" fill="#FBBF24" fontSize="9" textAnchor="middle">Prefill Stage</text>
 
-              {/* Decode Stage */}
-              <rect x="420" y="68" width="112" height="24" fill="#1a3d27" stroke="#4ADE80" strokeWidth="1" />
-              <text x="476" y="84" fill="#4ADE80" fontSize="9" textAnchor="middle">Decode Stage</text>
+              <rect x="420" y="62" width="112" height="24" fill="#1a3d27" stroke="#4ADE80" strokeWidth="1" />
+              <text x="476" y="78" fill="#4ADE80" fontSize="9" textAnchor="middle">Decode Stage</text>
 
-              {/* PagedKVCache */}
-              <rect x="566" y="34" width="112" height="24" fill="#1a1a1a" stroke="#2a2a2a" strokeWidth="1" />
-              <text x="622" y="50" fill="#888" fontSize="9" textAnchor="middle">PagedKVCache</text>
+              <rect x="566" y="32" width="112" height="24" fill="#1a1a1a" stroke="#2a2a2a" strokeWidth="1" />
+              <text x="622" y="48" fill="#888" fontSize="9" textAnchor="middle">PagedKVCache</text>
 
-              {/* CPUSwapPool */}
-              <rect x="566" y="90" width="112" height="24" fill="#3d1a1a" stroke="#F87171" strokeWidth="1" />
-              <text x="622" y="106" fill="#F87171" fontSize="9" textAnchor="middle">CPUSwapPool</text>
+              <rect x="566" y="82" width="112" height="24" fill="#3d1a1a" stroke="#F87171" strokeWidth="1" />
+              <text x="622" y="98" fill="#F87171" fontSize="9" textAnchor="middle">CPUSwapPool</text>
 
-              {/* ── Arrows ────────────────────────────────────────── */}
+              {/* ── Arrows ── */}
               {/* Request → RequestQueue */}
-              <line x1="96"  y1="58" x2="116"  y2="46" stroke="#444" strokeWidth="1" markerEnd="url(#arrow)" />
-
-              {/* RequestQueue → Scheduler Loop */}
-              <line x1="236" y1="46" x2="266"  y2="46" stroke="#444" strokeWidth="1" markerEnd="url(#arrow)" />
-
-              {/* Scheduler → Prefill (upper dashed amber) */}
-              <line x1="386" y1="40" x2="418"  y2="20" stroke="#FBBF24" strokeWidth="1" strokeDasharray="4,3" markerEnd="url(#arrow-amber)" />
-
-              {/* Scheduler → Decode (lower dashed green) */}
-              <line x1="386" y1="52" x2="418"  y2="72" stroke="#4ADE80" strokeWidth="1" strokeDasharray="4,3" markerEnd="url(#arrow-green)" />
-
+              <line x1="96"  y1="56" x2="116"  y2="44" stroke="#444" strokeWidth="1" markerEnd="url(#arr)" />
+              {/* RequestQueue → SchedulerLoop */}
+              <line x1="236" y1="44" x2="266"  y2="44" stroke="#444" strokeWidth="1" markerEnd="url(#arr)" />
+              {/* Scheduler → Prefill */}
+              <line x1="386" y1="38" x2="418"  y2="18" stroke="#FBBF24" strokeWidth="1" strokeDasharray="4,3" markerEnd="url(#arr-amber)" />
+              {/* Scheduler → Decode */}
+              <line x1="386" y1="50" x2="418"  y2="68" stroke="#4ADE80" strokeWidth="1" strokeDasharray="4,3" markerEnd="url(#arr-green)" />
               {/* Prefill → PagedKVCache */}
-              <line x1="532" y1="20" x2="564"  y2="38" stroke="#444" strokeWidth="1" markerEnd="url(#arrow)" />
-
+              <line x1="532" y1="18" x2="564"  y2="36" stroke="#444" strokeWidth="1" markerEnd="url(#arr)" />
               {/* Decode → PagedKVCache */}
-              <line x1="532" y1="74" x2="564"  y2="56" stroke="#444" strokeWidth="1" markerEnd="url(#arrow)" />
+              <line x1="532" y1="74" x2="564"  y2="54" stroke="#444" strokeWidth="1" markerEnd="url(#arr)" />
 
-              {/* PagedKVCache → CPUSwapPool (swap_out, vertical) */}
-              <line x1="622" y1="58" x2="622"  y2="88" stroke="#F87171" strokeWidth="1" strokeDasharray="3,2" markerEnd="url(#arrow-red)" />
-              <text x="634"  y="76" fill="#F87171" fontSize="7" textAnchor="start">swap_out</text>
+              {/* swap_out: PagedKVCache ↓ CPUSwapPool */}
+              <line x1="622" y1="56" x2="622"  y2="80" stroke="#F87171" strokeWidth="1" strokeDasharray="3,2" markerEnd="url(#arr-red)" />
+              <text x="630"  y="71" fill="#F87171" fontSize="7" textAnchor="start">swap_out</text>
 
-              {/* CPUSwapPool → PagedKVCache (swap_in, arc back on left side) */}
+              {/* swap_in: CPUSwapPool → PagedKVCache via left-side Bezier arc */}
               <path
-                d="M566,102 Q530,102 530,46 Q530,46 564,46"
-                fill="none"
-                stroke="#F87171"
-                strokeWidth="1"
-                strokeDasharray="3,2"
-                markerEnd="url(#arrow-red)"
+                d="M566,94 C518,94 518,44 566,44"
+                fill="none" stroke="#F87171" strokeWidth="1" strokeDasharray="3,2"
+                markerEnd="url(#arr-red)"
               />
-              <text x="498"  y="118" fill="#F87171" fontSize="7" textAnchor="middle">swap_in</text>
+              <text x="503"  y="73" fill="#F87171" fontSize="7" textAnchor="middle">swap_in</text>
             </svg>
           </div>
         </div>
