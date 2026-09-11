@@ -11,36 +11,53 @@ interface RepoStats {
 const REPO = 'TryingtobeingNikhil/vLLM_Inference_Engine';
 const DURATION = 2800; // ms
 
-/** Animates a number from 0 → target over DURATION ms with ease-out cubic */
+/**
+ * Animates from the current displayed value → new target whenever target changes.
+ * Uses ease-out cubic so it feels smooth and decelerates into the final number.
+ */
 function useCountUp(target: number): number {
   const [display, setDisplay] = useState(0);
-  const rafRef = useRef<number | null>(null);
-  const startRef = useRef<number | null>(null);
+  const rafRef    = useRef<number | null>(null);
+  const startRef  = useRef<number | null>(null);
+  const fromRef   = useRef<number>(0); // where this animation segment starts from
 
   useEffect(() => {
     if (target === 0) return;
+
+    // Cancel any running animation
     if (rafRef.current) cancelAnimationFrame(rafRef.current);
     startRef.current = null;
 
+    // Capture the current display value as the starting point
+    const from = fromRef.current;
+    const delta = target - from;
+
     const animate = (ts: number) => {
       if (!startRef.current) startRef.current = ts;
-      const elapsed = ts - startRef.current;
+      const elapsed  = ts - startRef.current;
       const progress = Math.min(elapsed / DURATION, 1);
       // ease-out cubic: 1 - (1-t)^3
       const eased = 1 - Math.pow(1 - progress, 3);
-      setDisplay(Math.round(eased * target));
-      if (progress < 1) rafRef.current = requestAnimationFrame(animate);
+      const current = Math.round(from + eased * delta);
+      setDisplay(current);
+      fromRef.current = current;
+      if (progress < 1) {
+        rafRef.current = requestAnimationFrame(animate);
+      } else {
+        fromRef.current = target; // lock to exact target at end
+      }
     };
 
     rafRef.current = requestAnimationFrame(animate);
     return () => { if (rafRef.current) cancelAnimationFrame(rafRef.current); };
-  }, [target]);
+  }, [target]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return display;
 }
 
 export function GitHubStats({ className = '' }: { className?: string }) {
-  const [stats, setStats] = useState<RepoStats>({ stars: 56, forks: 6, watchers: 56 });
+  // Fallback values kept in sync with real repo — updated to current count
+  const [stats, setStats] = useState<RepoStats>({ stars: 58, forks: 8, watchers: 58 });
   const [live, setLive] = useState(false);
 
   const displayStars = useCountUp(stats.stars);
@@ -52,15 +69,15 @@ export function GitHubStats({ className = '' }: { className?: string }) {
       .then((data) => {
         if (data.stargazers_count !== undefined) {
           setStats({
-            stars: data.stargazers_count,
-            forks: data.forks_count,
+            stars:    data.stargazers_count,
+            forks:    data.forks_count,
             watchers: data.watchers_count,
           });
           setLive(true);
         }
       })
       .catch(() => {
-        // silently fall back to default values — animation still plays from fallback
+        // silently fall back to hardcoded values above
       });
   }, []);
 
@@ -71,7 +88,7 @@ export function GitHubStats({ className = '' }: { className?: string }) {
         href={`https://github.com/${REPO}/stargazers`}
         target="_blank"
         rel="noopener noreferrer"
-        className="flex items-center gap-1.5 border border-[#2a2a2a] px-3 py-1.5 font-mono text-xs text-[#e8e8e8] transition-colors hover:border-[#fbbf24] hover:text-[#fbbf24] group"
+        className="flex items-center gap-1.5 border border-[#2a2a2a] px-3 py-1.5 font-mono text-xs text-[#e8e8e8] transition-colors hover:border-[#fbbf24] hover:text-[#fbbf24]"
         title="GitHub Stars"
       >
         <svg viewBox="0 0 16 16" fill="currentColor" className="h-3.5 w-3.5 text-[#fbbf24]" aria-hidden="true">
