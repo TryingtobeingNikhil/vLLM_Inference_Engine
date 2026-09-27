@@ -1,3 +1,6 @@
+import { Nav }                  from '@/components/Nav';
+import { RepoStatsProvider }    from '@/components/GitHubStats';
+import { getRepoStats }         from '@/lib/github';
 import { HeroSection }          from '@/components/HeroSection';
 import { SchedulerLiveSection }  from '@/components/SchedulerLiveSection';
 import { Phase1vs2Section }      from '@/components/Phase1vs2Section';
@@ -8,35 +11,44 @@ import { BenchmarksSection }     from '@/components/BenchmarksSection';
 import { APICodeSection }        from '@/components/APICodeSection';
 import { GitHubFooter }          from '@/components/GitHubFooter';
 
-export default function HomePage() {
+// Re-fetch GitHub stats at most once an hour (ISR).
+export const revalidate = 3600;
+
+export default async function HomePage() {
+  const repoStats = await getRepoStats();
+
   return (
-    <main>
-      {/* § 0 — Hero + live scheduler panel */}
-      <HeroSection />
+    <RepoStatsProvider initial={repoStats}>
+      <main>
+        <Nav />
 
-      {/* § 1 — Scheduler loop architecture */}
-      <SchedulerLiveSection />
+        {/* § 0 — Hero + live scheduler panel */}
+        <HeroSection />
 
-      {/* § 2 — Phase 1 (sequential) vs Phase 2–9 (continuous batching) */}
-      <Phase1vs2Section />
+        {/* § 1 — Scheduler loop architecture */}
+        <SchedulerLiveSection />
 
-      {/* § 3 — Paged KV cache visualisation */}
-      <KVCacheSection />
+        {/* § 2 — Phase 1 (sequential) vs Phase 2–9 (continuous batching) */}
+        <Phase1vs2Section />
 
-      {/* § 4 — CPU swap pool under memory pressure */}
-      <CPUSwapSection />
+        {/* § 3 — Paged KV cache visualisation */}
+        <KVCacheSection />
 
-      {/* § 5 — 11-phase build log timeline */}
-      <PhaseBuildLogSection />
+        {/* § 4 — CPU swap pool under memory pressure */}
+        <CPUSwapSection />
 
-      {/* § 6 — Measured benchmark numbers */}
-      <BenchmarksSection />
+        {/* § 5 — 11-phase build log timeline */}
+        <PhaseBuildLogSection />
 
-      {/* § 7 — HTTP API usage examples */}
-      <APICodeSection />
+        {/* § 6 — Measured benchmark numbers */}
+        <BenchmarksSection />
 
-      {/* § 8 — Footer */}
-      <GitHubFooter />
-    </main>
+        {/* § 7 — HTTP API usage examples */}
+        <APICodeSection />
+
+        {/* § 8 — Footer */}
+        <GitHubFooter />
+      </main>
+    </RepoStatsProvider>
   );
 }

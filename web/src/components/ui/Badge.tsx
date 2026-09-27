@@ -6,32 +6,35 @@ interface BadgeProps {
 }
 
 const variantStyles: Record<string, string> = {
-  demo:    'border-[#3a3a3a] text-[#666666]',
-  live:    'border-[#4ADE80] text-[#4ADE80]',
-  warn:    'border-[#FBBF24] text-[#FBBF24]',
-  neutral: 'border-[#3a3a3a] text-[#888888]',
-  green:   'border-[#4ADE80] text-[#4ADE80]',
-  amber:   'border-[#FBBF24] text-[#FBBF24]',
-  red:     'border-[#F87171] text-[#F87171]',
+  demo:    'border-line-2 bg-white/[0.03] text-fg-3',
+  live:    'border-mint/30 bg-mint/10 text-mint',
+  warn:    'border-amber/30 bg-amber/10 text-amber',
+  neutral: 'border-line-2 bg-white/[0.03] text-fg-2',
+  green:   'border-mint/30 bg-mint/10 text-mint',
+  amber:   'border-amber/30 bg-amber/10 text-amber',
+  red:     'border-rose/30 bg-rose/10 text-rose',
 };
 
 const dotColors: Record<string, string> = {
-  demo:    'bg-[#444444]',
-  live:    'bg-[#4ADE80]',
-  warn:    'bg-[#FBBF24]',
-  neutral: 'bg-[#888888]',
-  green:   'bg-[#4ADE80]',
-  amber:   'bg-[#FBBF24]',
-  red:     'bg-[#F87171]',
+  demo:    'bg-fg-4',
+  live:    'bg-mint',
+  warn:    'bg-amber',
+  neutral: 'bg-fg-3',
+  green:   'bg-mint',
+  amber:   'bg-amber',
+  red:     'bg-rose',
 };
 
 export function Badge({ label, variant = 'demo', dot = false, className = '' }: BadgeProps) {
   return (
     <span
-      className={`inline-flex items-center gap-1.5 border px-2 py-0.5 font-mono text-[10px] uppercase tracking-widest ${variantStyles[variant]} ${className}`}
+      className={`inline-flex items-center gap-1.5 whitespace-nowrap rounded-full border px-2.5 py-0.5 font-mono text-[10px] uppercase tracking-[0.14em] ${variantStyles[variant]} ${className}`}
     >
       {dot && (
-        <span className={`inline-block h-1.5 w-1.5 ${dotColors[variant]} animate-pulse`} />
+        <span className="relative inline-flex h-1.5 w-1.5">
+          <span className={`ping-soft absolute inset-0 rounded-full ${dotColors[variant]}`} />
+          <span className={`relative inline-block h-1.5 w-1.5 rounded-full ${dotColors[variant]}`} />
+        </span>
       )}
       {label}
     </span>

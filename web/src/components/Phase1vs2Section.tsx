@@ -1,87 +1,75 @@
 'use client';
 
-import { useState, useEffect, useRef } from 'react';
-import { SectionHeader } from '@/components/ui/SectionHeader';
+import { useState, useEffect, useRef, useCallback } from 'react';
+import { SectionHeader, Accent } from '@/components/ui/SectionHeader';
 import { Badge } from '@/components/ui/Badge';
+import { Card } from '@/components/ui/Card';
+import { Reveal } from '@/components/ui/Reveal';
+import { useInView, usePrefersReducedMotion } from '@/lib/motion';
 import { PHASE1_TIMELINE, PHASE2_TIMELINE, type TimelineBar } from '@/data/simulation';
 import { TTFT_SEQUENTIAL_UNDER_LOAD_MS, TTFT_BATCHED_UNDER_LOAD_MS } from '@/data/benchmarks';
 
 type Mode = 'phase1' | 'phase2';
 
-// Scale timeline bars to fit in the visual width
-// Phase 1 max = ~9161ms; Phase 2 max = ~541ms.
-// We want both to use the same relative scale (total wall-clock time)
-const P1_TOTAL_WALL = 9161;
-const P2_TOTAL_WALL = 3990;   // actual 4-way wall clock from benchmark data
-// Use the Phase 1 duration as the shared scale so comparison is visually honest
-const SCALE_MS = P1_TOTAL_WALL;
+// Both views share the Phase 1 wall clock so the comparison is visually honest.
+const SCALE_MS = 9161;
+const SWEEP_MS = 3400; // real time for the playhead to cross the chart
+const REQ_COLORS = ['#4ADE80', '#60A5FA', '#FBBF24', '#A78BFA'];
 
-function pct(ms: number) {
-  return `${Math.max(0, Math.min(100, (ms / SCALE_MS) * 100)).toFixed(2)}%`;
-}
+const pct = (ms: number) => (ms / SCALE_MS) * 100;
+const fmtMs = (ms: number) => (ms < 1000 ? `${ms.toFixed(0)} ms` : `${(ms / 1000).toFixed(2)} s`);
 
-function TimelineRow({
-  bar,
-  animate,
-  showTtftLabel,
-}: {
-  bar: TimelineBar;
-  animate: boolean;
-  showTtftLabel: boolean;
-}) {
-  const waitPct = (bar.waitStartMs / SCALE_MS) * 100;
-  const prefillPct = ((bar.prefillStartMs - bar.waitStartMs) / SCALE_MS) * 100;
-  const decodePct = ((bar.decodeStartMs - bar.prefillStartMs) / SCALE_MS) * 100;
-  const runPct = ((bar.finishMs - bar.decodeStartMs) / SCALE_MS) * 100;
-  const ttftLinePct = (bar.decodeStartMs / SCALE_MS) * 100;
+function TimelineRow({ bar, t, color }: { bar: TimelineBar; t: number; color: string }) {
+  const queued = pct(bar.prefillStartMs - bar.waitStartMs);
+  const prefill = pct(bar.decodeStartMs - bar.prefillStartMs);
+  const decode = pct(bar.finishMs - bar.decodeStartMs);
+  const firstToken = t >= bar.decodeStartMs;
+  const done = t >= bar.finishMs;
 
   return (
-    <div className="flex items-center gap-3 py-1">
-      <span className="w-12 font-mono text-[11px] text-[#555555]">{bar.label}</span>
-      <div className="relative h-6 flex-1" style={{ backgroundColor: '#0d0d0d', border: '1px solid #1a1a1a' }}>
-        {/* Waiting/queued (amber dim) */}
-        {prefillPct > 0.1 && (
-          <div
-            className={`absolute inset-y-0 transition-all ${animate ? 'duration-[2000ms]' : 'duration-0'} ease-out`}
-            style={{
-              left: `${waitPct}%`,
-              width: animate ? `${prefillPct}%` : '0%',
-              backgroundColor: '#3d2e0a',
-              opacity: 0.7,
-            }}
-          />
-        )}
-        {/* Prefill stage */}
-        {decodePct > 0.1 && (
-          <div
-            className={`absolute inset-y-0 transition-all ${animate ? 'duration-[2000ms] delay-300' : 'duration-0'} ease-out`}
-            style={{
-              left: `${waitPct + prefillPct}%`,
-              width: animate ? `${decodePct}%` : '0%',
-              backgroundColor: '#3d2e0a',
-            }}
-          />
-        )}
-        {/* Decoding (green) */}
+    <div className="grid grid-cols-[52px_1fr] items-center gap-3 py-1.5 sm:grid-cols-[60px_1fr_104px]">
+      <span className="flex items-center gap-2 font-mono text-[11px] text-fg-2">
+        <span className="h-2 w-2 rounded-[3px]" style={{ backgroundColor: color }} />
+        {bar.label}
+      </span>
+
+      <div className="relative h-7 rounded-lg border border-line bg-white/[0.015]">
         <div
-          className={`absolute inset-y-0 transition-all ${animate ? 'duration-[2500ms] delay-500' : 'duration-0'} ease-out`}
-          style={{
-            left: `${waitPct + prefillPct + decodePct}%`,
-            width: animate ? `${runPct}%` : '0%',
-            backgroundColor: '#1a3d27',
-          }}
-        />
-        {/* TTFT line */}
+          className="absolute inset-0 flex overflow-hidden rounded-lg"
+          style={{ clipPath: `inset(0 ${100 - pct(t)}% 0 0)` }}
+        >
+          <div style={{ width: `${pct(bar.waitStartMs)}%` }} />
+          {queued > 0.05 && <div className="hatch h-full" style={{ width: `${queued}%` }} />}
+          <div className="h-full bg-amber/30" style={{ width: `${prefill}%` }} />
+          <div
+            className="h-full rounded-r-md"
+            style={{ width: `${decode}%`, background: 'linear-gradient(90deg, rgba(74,222,128,0.28), rgba(74,222,128,0.5))' }}
+          />
+        </div>
+        {/* First-token flag */}
         <div
-          className="absolute inset-y-0 w-px"
-          style={{ left: `${ttftLinePct}%`, backgroundColor: '#4ADE80', opacity: 0.7 }}
-        />
+          className="absolute -top-1 bottom-[-4px] w-px bg-mint transition-opacity duration-300"
+          style={{ left: `${pct(bar.decodeStartMs)}%`, opacity: firstToken ? 1 : 0 }}
+        >
+          <span
+            className="absolute -top-1 left-0 h-2 w-2 -translate-x-1/2 rounded-full bg-mint shadow-[0_0_10px_#4ADE80] transition-transform duration-500 [transition-timing-function:var(--ease-spring)]"
+            style={{ transform: `translateX(-50%) scale(${firstToken ? 1 : 0})` }}
+          />
+        </div>
+        {done && (
+          <span className="absolute right-1 top-1/2 -translate-y-1/2 rounded bg-ink-950/85 px-1 font-mono text-[9.5px] text-fg-2 sm:hidden">
+            {fmtMs(bar.ttftMs)}
+          </span>
+        )}
       </div>
-      {/* TTFT label */}
-      <span className="w-24 text-right font-mono text-[10px] text-[#555555]">
-        TTFT{' '}
-        <span className={bar.ttftMs > 500 ? 'text-[#F87171]' : 'text-[#4ADE80]'}>
-          {bar.ttftMs < 1000 ? `${bar.ttftMs.toFixed(0)}ms` : `${(bar.ttftMs / 1000).toFixed(2)}s`}
+
+      <span className="hidden text-right font-mono text-[11px] sm:block">
+        <span className="text-fg-4">TTFT </span>
+        <span
+          className="tabular-nums transition-opacity duration-300"
+          style={{ color: bar.ttftMs > 500 ? '#FB7185' : '#4ADE80', opacity: firstToken ? 1 : 0.15 }}
+        >
+          {fmtMs(bar.ttftMs)}
         </span>
       </span>
     </div>
@@ -90,270 +78,271 @@ function TimelineRow({
 
 export function Phase1vs2Section() {
   const [mode, setMode] = useState<Mode>('phase1');
-  const [animated, setAnimated] = useState(false);
-  const [hasStarted, setHasStarted] = useState(false);
-  const sectionRef = useRef<HTMLDivElement>(null);
-  const observerRef = useRef<IntersectionObserver | null>(null);
+  const [t, setT] = useState(0);
+  const [ref, inView] = useInView<HTMLDivElement>({ threshold: 0.35 });
+  const reduced = usePrefersReducedMotion();
+  const raf = useRef(0);
 
-  // Auto-animate once when section enters viewport
-  useEffect(() => {
-    observerRef.current = new IntersectionObserver(
-      (entries) => {
-        if (entries[0].isIntersecting && !hasStarted) {
-          setHasStarted(true);
-          setAnimated(true);
-        }
-      },
-      { threshold: 0.3 },
-    );
-    if (sectionRef.current) observerRef.current.observe(sectionRef.current);
-    return () => observerRef.current?.disconnect();
-  }, [hasStarted]);
+  const play = useCallback(() => {
+    cancelAnimationFrame(raf.current);
+    if (reduced) { setT(SCALE_MS); return; }
+    const start = performance.now();
+    const step = (now: number) => {
+      const p = Math.min((now - start) / SWEEP_MS, 1);
+      setT(p * SCALE_MS);
+      if (p < 1) raf.current = requestAnimationFrame(step);
+    };
+    setT(0);
+    raf.current = requestAnimationFrame(step);
+  }, [reduced]);
 
-  const handleReplay = () => {
-    setAnimated(false);
-    setTimeout(() => setAnimated(true), 50);
-  };
+  useEffect(() => { if (inView) play(); }, [inView, play]);
+  useEffect(() => () => cancelAnimationFrame(raf.current), []);
 
   const handleModeChange = (m: Mode) => {
+    if (m === mode) return;
     setMode(m);
-    setAnimated(false);
-    setTimeout(() => setAnimated(true), 50);
+    play();
   };
 
   const bars = mode === 'phase1' ? PHASE1_TIMELINE : PHASE2_TIMELINE;
+  const allDoneAt = Math.max(...bars.map((b) => b.finishMs));
+  const finished = t >= allDoneAt;
 
   return (
-    <section
-      id="comparison"
-      ref={sectionRef}
-      className="border-b border-[#1e1e1e] px-6 py-20 sm:px-10 lg:px-16"
-    >
+    <section id="comparison" className="relative px-5 py-24 sm:px-6 sm:py-32">
       <div className="mx-auto max-w-5xl">
         <SectionHeader
-          label="// phase comparison"
-          title="Sequential vs Continuous Batching"
-          subtitle="4 concurrent requests, 50 tokens each. The wall clock scale is identical across both views."
+          index="02"
+          label="Phase comparison"
+          title={<>Four requests. <Accent gradient>Two very different waits.</Accent></>}
+          subtitle="4 concurrent requests, 50 tokens each. The wall-clock scale is identical across both views — watch where the playhead is when the last request finishes."
         />
 
-        {/* ── Tab switcher ─────────────────────────────────────── */}
-        <div className="mb-6 flex items-center gap-0">
+        <Reveal>
+          <div ref={ref} className="surface overflow-hidden">
+            {/* Controls */}
+            <div className="flex flex-wrap items-center gap-3 border-b border-line px-4 py-3 sm:px-5">
+              <div className="relative grid grid-cols-2 rounded-full border border-line-2 bg-ink-950 p-1" role="tablist">
+                <span
+                  className="absolute inset-y-1 left-1 w-[calc(50%-4px)] rounded-full transition-all duration-500 [transition-timing-function:var(--ease-spring)]"
+                  style={{
+                    transform: mode === 'phase2' ? 'translateX(100%)' : 'none',
+                    background: mode === 'phase1' ? 'rgba(251,113,133,0.14)' : 'rgba(74,222,128,0.14)',
+                    boxShadow: `inset 0 0 0 1px ${mode === 'phase1' ? 'rgba(251,113,133,0.35)' : 'rgba(74,222,128,0.35)'}`,
+                  }}
+                  aria-hidden="true"
+                />
+                {[
+                  { id: 'phase1' as Mode, prefix: 'Phase 1 · ', label: 'Sequential', on: 'text-rose' },
+                  { id: 'phase2' as Mode, prefix: 'Phase 2–9 · ', label: 'Batched', on: 'text-mint' },
+                ].map((tab) => (
+                  <button
+                    key={tab.id}
+                    role="tab"
+                    aria-selected={mode === tab.id}
+                    onClick={() => handleModeChange(tab.id)}
+                    className={`relative z-10 whitespace-nowrap rounded-full px-3 py-1.5 font-mono text-[11px] transition-colors duration-300 sm:px-4 sm:text-xs ${
+                      mode === tab.id ? tab.on : 'text-fg-3 hover:text-fg'
+                    }`}
+                  >
+                    <span className="hidden sm:inline">{tab.prefix}</span>
+                    {tab.label}
+                  </button>
+                ))}
+              </div>
+              <div className="ml-auto flex items-center gap-2">
+                <Badge label="Benchmark replay" variant="demo" className="hidden sm:inline-flex" />
+                <button
+                  onClick={play}
+                  className="group inline-flex items-center gap-1.5 rounded-full border border-line-2 px-3 py-1.5 font-mono text-[11px] text-fg-2 transition-colors hover:border-white/25 hover:text-fg"
+                >
+                  <span className="inline-block transition-transform duration-500 group-hover:-rotate-180">↺</span> Replay
+                </button>
+              </div>
+            </div>
+
+            {/* Chart */}
+            <div className="px-4 pb-5 pt-6 sm:px-5">
+              <div className="mb-3 grid grid-cols-[52px_1fr] gap-3 sm:grid-cols-[60px_1fr_104px]">
+                <span />
+                <div className="relative h-4 font-mono text-[9.5px] text-fg-4">
+                  {[0, 2000, 4000, 6000, 8000].map((ms) => (
+                    <span key={ms} className="absolute -translate-x-1/2 first:translate-x-0" style={{ left: `${pct(ms)}%` }}>
+                      {ms / 1000}s
+                    </span>
+                  ))}
+                </div>
+              </div>
+
+              <div className="relative">
+                {bars.map((bar, i) => (
+                  <TimelineRow key={bar.reqId} bar={bar} t={t} color={REQ_COLORS[i]} />
+                ))}
+
+                {/* Playhead */}
+                <div className="pointer-events-none absolute inset-y-0 left-[64px] right-0 sm:left-[72px] sm:right-[116px]">
+                  <div
+                    className="absolute -bottom-1 -top-1 w-px bg-white/40"
+                    style={{ left: `${pct(t)}%`, opacity: t >= SCALE_MS ? 0 : 1 }}
+                  >
+                    <span className="absolute -bottom-6 left-1/2 -translate-x-1/2 whitespace-nowrap rounded-full bg-white/10 px-1.5 py-0.5 font-mono text-[9.5px] tabular-nums text-fg">
+                      {(t / 1000).toFixed(2)}s
+                    </span>
+                  </div>
+                </div>
+              </div>
+
+              <div className="mt-9 flex flex-wrap items-center justify-between gap-3">
+                <div className="flex flex-wrap gap-4 font-mono text-[10.5px] text-fg-3">
+                  <span className="flex items-center gap-1.5"><span className="hatch h-3 w-5 rounded-sm border border-line" />queued</span>
+                  <span className="flex items-center gap-1.5"><span className="h-3 w-5 rounded-sm bg-amber/30" />prefill</span>
+                  <span className="flex items-center gap-1.5"><span className="h-3 w-5 rounded-sm bg-mint/40" />decoding</span>
+                  <span className="flex items-center gap-1.5"><span className="h-2 w-2 rounded-full bg-mint" />first token</span>
+                </div>
+                <p
+                  className={`font-mono text-[11px] transition-all duration-500 ${finished ? 'opacity-100' : 'translate-y-1 opacity-0'} ${
+                    mode === 'phase1' ? 'text-rose' : 'text-mint'
+                  }`}
+                >
+                  {mode === 'phase1'
+                    ? `Req 4 waited ${fmtMs(PHASE1_TIMELINE[3].ttftMs)} for its first token.`
+                    : `All 4 finished at ${fmtMs(allDoneAt)} — first token in ${TTFT_BATCHED_UNDER_LOAD_MS} ms.`}
+                </p>
+              </div>
+            </div>
+          </div>
+        </Reveal>
+
+        {/* Stat comparison cards */}
+        <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-3">
           {[
-            { id: 'phase1' as Mode, label: 'Phase 1 — Sequential' },
-            { id: 'phase2' as Mode, label: 'Phase 2–9 — Batched' },
-          ].map((tab) => (
-            <button
-              key={tab.id}
-              onClick={() => handleModeChange(tab.id)}
-              className={`border px-4 py-2 font-mono text-xs transition-colors ${
-                mode === tab.id
-                  ? 'border-[#4ADE80] bg-[#1a3d27] text-[#4ADE80]'
-                  : 'border-[#2a2a2a] bg-[#111111] text-[#555555] hover:text-[#888888]'
-              }`}
-            >
-              {tab.label}
-            </button>
+            { label: 'TTFT under 4-way load', before: `${TTFT_SEQUENTIAL_UNDER_LOAD_MS.toLocaleString()} ms`, after: `${TTFT_BATCHED_UNDER_LOAD_MS} ms`, delta: '−98.5%' },
+            { label: 'Wall clock (all done)', before: '5,673 ms', after: '3,990 ms', delta: '−29.6%' },
+            { label: 'Aggregate throughput', before: '42.0 tok/s', after: '50.1 tok/s', delta: '+19.3%' },
+          ].map((s, i) => (
+            <Reveal key={s.label} delay={i * 90}>
+              <StatDiff {...s} />
+            </Reveal>
           ))}
-          <div className="ml-auto flex items-center gap-3">
-            <Badge label="Benchmark Replay" variant="demo" />
-            <button
-              onClick={handleReplay}
-              className="border border-[#2a2a2a] px-3 py-1.5 font-mono text-[11px] text-[#555555] transition-colors hover:text-[#888888]"
-            >
-              ↺ Replay
-            </button>
-          </div>
         </div>
 
-        {/* ── Timeline chart ───────────────────────────────────── */}
-        <div className="border border-[#2a2a2a] bg-[#0d0d0d] p-4">
-          {/* Legend */}
-          <div className="mb-4 flex flex-wrap gap-4">
-            <LegendItem color="#3d2e0a" label="Waiting / Prefill" />
-            <LegendItem color="#1a3d27" label="Decoding" />
-            <LegendItem color="#4ADE80" label="TTFT marker" line />
-          </div>
-
-          {/* Scale label */}
-          <div className="mb-2 flex justify-between font-mono text-[9px] text-[#333333]">
-            <span>0ms</span>
-            <span>{mode === 'phase1' ? '~9,161ms (wall clock)' : '~9,161ms (same scale)'}</span>
-          </div>
-
-          {bars.map((bar, i) => (
-            <TimelineRow key={bar.reqId} bar={bar} animate={animated} showTtftLabel={i === 0} />
-          ))}
-
-          {mode === 'phase1' && (
-            <p className="mt-3 font-mono text-[10px] text-[#444444]">
-              ↑ Requests 2–4 wait behind a complete generation. TTFT = wall-clock wait + prefill.
-            </p>
-          )}
-          {mode === 'phase2' && (
-            <p className="mt-3 font-mono text-[10px] text-[#4ADE80]/60">
-              ↑ All 4 requests admitted concurrently. First token arrives within{' '}
-              {TTFT_BATCHED_UNDER_LOAD_MS} ms for Req 1.
-            </p>
-          )}
-        </div>
-
-        {/* ── Stat comparison cards ────────────────────────────── */}
-        <div className="mt-4 grid grid-cols-2 gap-3 sm:grid-cols-3">
-          <StatDiff
-            label="TTFT under 4-way load"
-            before={`${TTFT_SEQUENTIAL_UNDER_LOAD_MS.toLocaleString()} ms`}
-            after={`${TTFT_BATCHED_UNDER_LOAD_MS} ms`}
-            delta="−98.5%"
-            positive
-          />
-          <StatDiff
-            label="Wall clock (all done)"
-            before="5,673 ms"
-            after="3,990 ms"
-            delta="−29.6%"
-            positive
-          />
-          <StatDiff
-            label="Aggregate throughput"
-            before="42.0 tok/s"
-            after="50.1 tok/s"
-            delta="+19.3%"
-            positive
-          />
-        </div>
-
-        {/* ── "Add Request" interactive demo ───────────────────── */}
-        <AddRequestDemo mode={mode} />
+        <Reveal>
+          <AddRequestDemo mode={mode} />
+        </Reveal>
       </div>
     </section>
   );
 }
 
-function LegendItem({
-  color,
-  label,
-  line = false,
-}: {
-  color: string;
-  label: string;
-  line?: boolean;
-}) {
+function StatDiff({ label, before, after, delta }: { label: string; before: string; after: string; delta: string }) {
   return (
-    <div className="flex items-center gap-1.5">
-      <div
-        className="h-3 w-5"
-        style={{
-          backgroundColor: line ? 'transparent' : color,
-          border: line ? `1px solid ${color}` : 'none',
-        }}
-      />
-      <span className="font-mono text-[10px] text-[#555555]">{label}</span>
-    </div>
-  );
-}
-
-function StatDiff({
-  label,
-  before,
-  after,
-  delta,
-  positive,
-}: {
-  label: string;
-  before: string;
-  after: string;
-  delta: string;
-  positive: boolean;
-}) {
-  return (
-    <div className="border border-[#2a2a2a] bg-[#111111] p-3">
-      <p className="mb-2 font-mono text-[9px] uppercase tracking-widest text-[#444444]">{label}</p>
-      <p className="font-mono text-[11px] text-[#555555] line-through">{before}</p>
-      <p className="font-mono text-sm text-[#e8e8e8]">{after}</p>
-      <p className={`mt-1 font-mono text-xs font-semibold ${positive ? 'text-[#4ADE80]' : 'text-[#F87171]'}`}>
-        {delta}
-      </p>
-    </div>
+    <Card className="h-full">
+      <p className="mb-5 font-mono text-[10px] uppercase tracking-[0.16em] text-fg-3">{label}</p>
+      <div className="flex items-end justify-between gap-3">
+        <div>
+          <p className="font-mono text-[12px] text-fg-4 line-through decoration-rose/60">{before}</p>
+          <p className="mt-1 text-2xl font-semibold tracking-tight text-fg">{after}</p>
+        </div>
+        <span className="rounded-full bg-mint/10 px-2.5 py-1 font-mono text-xs font-medium text-mint">{delta}</span>
+      </div>
+    </Card>
   );
 }
 
 // ── "Add Request" interactive demo ────────────────────────────────────────────
 
-interface InjectedReq {
-  id: string;
-  state: 'waiting' | 'admitted' | 'decoding' | 'done';
-}
+type ReqState = 'waiting' | 'admitted' | 'decoding' | 'done';
+const STEPS: { id: ReqState; label: string; color: string }[] = [
+  { id: 'waiting', label: 'Waiting', color: '#FBBF24' },
+  { id: 'admitted', label: 'Admitted', color: '#60A5FA' },
+  { id: 'decoding', label: 'Decoding', color: '#4ADE80' },
+  { id: 'done', label: 'Done', color: '#A6A6B0' },
+];
 
 function AddRequestDemo({ mode }: { mode: Mode }) {
-  const [injected, setInjected] = useState<InjectedReq | null>(null);
+  const [req, setReq] = useState<{ id: string; state: ReqState } | null>(null);
   const [step, setStep] = useState(0);
 
   const inject = () => {
     const id = Math.random().toString(36).slice(2, 6);
-    setInjected({ id, state: 'waiting' });
+    setReq({ id, state: 'waiting' });
     setStep(1);
   };
 
-  // Advance state machine on each step
+  // Reset when switching modes so the demo always matches the chart.
+  useEffect(() => { setReq(null); setStep(0); }, [mode]);
+
   useEffect(() => {
-    if (!injected) return;
-    if (step === 0) return;
-    const delays =
-      mode === 'phase1'
-        ? [0, 0, 0, 5000] // Phase 1: stays waiting a long time
-        : [0, 400, 1200, 3000]; // Phase 2: admitted quickly
+    if (!req || step === 0) return;
+    const delays = mode === 'phase1' ? [0, 5000, 600, 2400] : [0, 400, 800, 1800];
     const timer = setTimeout(() => {
-      if (step === 1) setInjected((s) => s && { ...s, state: 'admitted' });
-      if (step === 2) setInjected((s) => s && { ...s, state: 'decoding' });
+      if (step === 1) setReq((s) => s && { ...s, state: 'admitted' });
+      if (step === 2) setReq((s) => s && { ...s, state: 'decoding' });
       if (step === 3) {
-        setInjected((s) => s && { ...s, state: 'done' });
-        setTimeout(() => { setInjected(null); setStep(0); }, 1500);
+        setReq((s) => s && { ...s, state: 'done' });
+        setTimeout(() => { setReq(null); setStep(0); }, 1600);
       }
       setStep((s) => s + 1);
     }, delays[step]);
     return () => clearTimeout(timer);
-  }, [step, injected, mode]);
+  }, [step, req, mode]);
 
-  const stateColors: Record<string, string> = {
-    waiting:  '#FBBF24',
-    admitted: '#60A5FA',
-    decoding: '#4ADE80',
-    done:     '#555555',
-  };
+  const activeIdx = req ? STEPS.findIndex((s) => s.id === req.state) : -1;
+  const hint = !req
+    ? mode === 'phase1'
+      ? 'In sequential mode it has to wait for the whole running generation.'
+      : 'In batched mode it slides into the running batch at the next iteration.'
+    : req.state === 'waiting' && mode === 'phase1'
+    ? 'Blocked behind asyncio.Lock… still waiting…'
+    : req.state === 'admitted'
+    ? 'Interleaved with the running batch.'
+    : req.state === 'decoding'
+    ? 'Streaming tokens.'
+    : req.state === 'done'
+    ? 'Finished — blocks returned to the pool.'
+    : 'Queued for the next iteration.';
 
   return (
-    <div className="mt-4 border border-[#2a2a2a] bg-[#111111] p-4">
-      <div className="flex items-center justify-between">
-        <p className="font-mono text-[11px] text-[#555555]">
-          Inject a synthetic 5th request →
+    <div className="mt-4 flex flex-col gap-4 rounded-2xl border border-dashed border-line-2 p-4 sm:flex-row sm:items-center sm:p-5">
+      <div className="min-w-0 flex-1">
+        <p className="text-[14px] font-medium text-fg">
+          Try it: inject a 5th request{req && <span className="ml-2 font-mono text-[11px] text-fg-3">seq-{req.id}</span>}
         </p>
-        <button
-          onClick={inject}
-          disabled={!!injected}
-          className="border border-[#3a3a3a] px-3 py-1.5 font-mono text-[11px] text-[#888888] transition-colors hover:border-[#666666] hover:text-[#cccccc] disabled:cursor-not-allowed disabled:opacity-40"
-        >
-          + Add Request
-        </button>
-      </div>
-      {injected && (
-        <div className="mt-3 flex items-center gap-2 font-mono text-[11px]">
-          <span className="text-[#444444]">seq-{injected.id}</span>
-          <span className="text-[#333333]">→</span>
-          <span style={{ color: stateColors[injected.state] }}>
-            {injected.state.toUpperCase()}
-          </span>
-          {mode === 'phase1' && injected.state === 'waiting' && (
-            <span className="text-[#444444]">
-              &nbsp;(blocked behind active generation…)
-            </span>
-          )}
-          {mode === 'phase2' && injected.state === 'admitted' && (
-            <span className="text-[#444444]">
-              &nbsp;(interleaved with running batch)
-            </span>
-          )}
+        <p className="mt-1 text-[13px] text-fg-3">{hint}</p>
+        <div className="mt-3 flex items-center gap-1.5">
+          {STEPS.map((s, i) => {
+            const reached = i <= activeIdx;
+            const current = i === activeIdx;
+            return (
+              <div key={s.id} className="flex items-center gap-1.5">
+                <span
+                  className="rounded-full border px-2 py-0.5 font-mono text-[10px] uppercase tracking-[0.1em] transition-all duration-500"
+                  style={{
+                    color: reached ? s.color : '#52525B',
+                    borderColor: reached ? `${s.color}55` : 'rgba(255,255,255,0.07)',
+                    backgroundColor: current ? `${s.color}18` : 'transparent',
+                    boxShadow: current ? `0 0 16px -2px ${s.color}66` : 'none',
+                  }}
+                >
+                  {s.label}
+                </span>
+                {i < STEPS.length - 1 && (
+                  <span className="h-px w-3 transition-colors duration-500 sm:w-5" style={{ backgroundColor: i < activeIdx ? s.color : 'rgba(255,255,255,0.1)' }} />
+                )}
+              </div>
+            );
+          })}
         </div>
-      )}
+      </div>
+      <button
+        onClick={inject}
+        disabled={!!req}
+        className="group inline-flex shrink-0 items-center justify-center gap-2 rounded-full bg-fg px-5 py-2.5 text-sm font-medium text-ink-950 transition-all duration-300 hover:-translate-y-0.5 hover:shadow-[0_10px_30px_-10px_rgba(255,255,255,0.5)] disabled:translate-y-0 disabled:cursor-not-allowed disabled:opacity-30 disabled:shadow-none"
+      >
+        <span className="text-base leading-none transition-transform duration-300 group-hover:rotate-90">+</span>
+        Add request
+      </button>
     </div>
   );
 }
