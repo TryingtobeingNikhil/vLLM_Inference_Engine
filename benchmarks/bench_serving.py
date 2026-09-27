@@ -126,9 +126,10 @@ class ServerProcess:
 
 
 async def run_level(url: str, items, rate: Optional[float], concurrency: Optional[int],
-                    seed: int, slo_ttft_ms: float, slo_tpot_ms: float) -> dict:
+                    seed: int, slo_ttft_ms: float, slo_tpot_ms: float,
+                    ignore_eos: bool = True) -> dict:
     runner = LoadTestRunner(base_url=url, max_concurrent=None, request_timeout_s=3600,
-                            stream=True, ignore_eos=True)
+                            stream=True, ignore_eos=ignore_eos)
     before = await scrape_metrics(url)
     with GPUMonitor() as gpu:
         t0 = time.perf_counter()
@@ -194,7 +195,7 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--model", default="auto")
     p.add_argument("--draft-model", default="auto", help=f"for the 'draft' config (auto = {DRAFT_MODEL})")
-    p.add_argument("--configs", default="sequential,continuous,prefix,ngram")
+    p.add_argument("--configs", default="sequential,continuous,prefix")
     p.add_argument("--workload", default="random",
                    choices=["random", "shared_prefix", "repetitive", "chat"])
     p.add_argument("--num-requests", type=int, default=200)
@@ -206,6 +207,10 @@ def main() -> None:
                    help="Poisson request rates (req/s); inf = all at once")
     p.add_argument("--concurrency", type=int, nargs="+", default=None,
                    help="closed-loop concurrency levels (instead of --rates)")
+    p.add_argument("--natural-stop", action="store_true",
+                   help="let outputs end at EOS instead of forcing fixed lengths; use this "
+                        "when comparing speculative decoding (greedy speculation is exact, "
+                        "so every config emits the same text)")
     p.add_argument("--slo-ttft-ms", type=float, default=2000.0)
     p.add_argument("--slo-tpot-ms", type=float, default=100.0)
     p.add_argument("--port", type=int, default=8001)
@@ -247,7 +252,8 @@ def main() -> None:
     info["model"] = model_name
     payload = {"system": info, "args": vars(args), "configs": {}}
     markdown = [f"## Serving benchmark — {info.get('gpu', info['device'].upper())} — {model_name}\n",
-                f"workload `{args.workload}`, streaming, fixed output lengths (ignore_eos); "
+                f"workload `{args.workload}`, streaming, "
+                f"{'outputs end at EOS' if args.natural_stop else 'fixed output lengths (ignore_eos)'}; "
                 f"SLO: TTFT ≤ {args.slo_ttft_ms:.0f} ms and TPOT ≤ {args.slo_tpot_ms:.0f} ms. "
                 f"Latencies in ms, measured on the client from the scheduled send time.\n"]
 
@@ -276,7 +282,8 @@ def main() -> None:
                 label = level_label(rate, conc)
                 print(f"  load {label}: {len(subset)} requests …", flush=True)
                 report = asyncio.run(run_level(server.url, subset, rate, conc, args.seed,
-                                               args.slo_ttft_ms, args.slo_tpot_ms))
+                                               args.slo_ttft_ms, args.slo_tpot_ms,
+                                               ignore_eos=not args.natural_stop))
                 lat = report["latency"]
                 print(f"    {report['throughput_tokens_per_sec']:.1f} out tok/s | "
                       f"TTFT p50/p99 {lat['ttft_ms']['p50']:.0f}/{lat['ttft_ms']['p99']:.0f} ms | "

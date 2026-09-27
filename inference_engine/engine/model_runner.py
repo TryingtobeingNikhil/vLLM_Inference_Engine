@@ -274,7 +274,12 @@ def determine_num_blocks(
 
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
-    profile_tokens = config.prefill_budget_tokens + config.max_batch_size
+    # Worst-case step: a full prefill budget plus every running sequence
+    # decoding — with k speculative tokens each when speculation is on (those
+    # all need logits, which dominate at vocab sizes of ~150k).
+    lookahead = config.num_speculative_tokens if config.speculative_method else 0
+    decode_rows = config.max_batch_size * (1 + lookahead)
+    profile_tokens = config.prefill_budget_tokens + decode_rows
     profile_blocks = math.ceil(profile_tokens / bs) + 1
     temp_pool_bytes = 0
     for model, kv_cfg in zip(models, kv_configs):
@@ -288,7 +293,7 @@ def determine_num_blocks(
             token_ids=[i % vocab for i in range(profile_tokens)],
             start_pos=0,
             block_table=list(range(profile_blocks)),
-            num_logits=min(profile_tokens, config.max_batch_size),
+            num_logits=min(profile_tokens, decode_rows),
         )
         runner.forward_logits([dummy])
         del runner, pool

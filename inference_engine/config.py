@@ -16,6 +16,12 @@ from __future__ import annotations
 import os
 from dataclasses import MISSING, dataclass, field, fields
 
+# Every engine step allocates temporaries of a different shape; expandable
+# segments stop PyTorch's CUDA caching allocator from fragmenting (and slowly
+# growing its reserve) under that pattern.  Must be set before the first CUDA
+# allocation; ignored on non-CUDA builds.  Respect a user-provided value.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 
 def _auto_detect_device() -> str:
     """

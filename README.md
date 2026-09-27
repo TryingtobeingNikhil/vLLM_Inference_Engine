@@ -229,15 +229,17 @@ python -m benchmarks.bench_offline [--suites batching,prefix,spec] [--draft-mode
 |---|---|---|
 | `batching` | random prompts (256–512 tok), outputs 128–256 tok | HF sequential · HF static batching · engine with batch size 1 · continuous batching |
 | `prefix` | 1k-token shared system prompt + short questions | prefix caching off vs on |
-| `spec` | copy-heavy prompts, and random prompts | none · n-gram · draft model |
+| `spec` | copy-heavy prompts, and chat questions — outputs end at EOS | none · n-gram · draft model |
 
 Reports output tok/s, speedup, TTFT/TPOT/ITL percentiles, peak GPU memory, mean GPU utilisation, prefix-hit and acceptance rates.
 
 ### Serving — latency under load
 
 ```bash
-python -m benchmarks.bench_serving [--configs sequential,continuous,prefix,ngram] \
-    [--workload random|shared_prefix|repetitive] [--rates 2 4 8 16 inf | --concurrency 1 8 32 64]
+python -m benchmarks.bench_serving [--configs sequential,continuous,prefix] \
+    [--workload random|shared_prefix|repetitive|chat] [--rates 2 4 8 16 inf | --concurrency 1 8 32 64]
+# speculative decoding: compare with natural stopping
+python -m benchmarks.bench_serving --configs prefix,ngram --workload chat --natural-stop
 ```
 
 Launches a server per configuration, sweeps Poisson request rates (open loop) or fixed concurrencies (closed loop) with a streaming client, and reports per level: throughput, TTFT / TPOT / ITL / E2E p50–p99, goodput (share of requests meeting TTFT ≤ 2 s and TPOT ≤ 100 ms), GPU utilisation and memory, plus engine stats from `/metrics`.
@@ -258,7 +260,7 @@ python run_load_test.py --server custom --url http://localhost:8000 --api openai
 - **TPOT** — (last token − first token) / (tokens − 1), per request.
 - **ITL** — every gap between streamed chunks, pooled across requests.
 - **E2E** — scheduled send time → last token.
-- Latency is measured from the *scheduled* send time, so a server that falls behind is charged for it (no coordinated omission). Benchmarks use `ignore_eos` so every system generates the same number of tokens.
+- Latency is measured from the *scheduled* send time, so a server that falls behind is charged for it (no coordinated omission). Batching and prefix-caching benchmarks use `ignore_eos` so every system generates the same number of tokens. Speculative-decoding benchmarks let outputs end at EOS instead: forcing generation past EOS makes models repeat themselves, which n-gram drafts predict almost perfectly and would overstate the speedup (greedy speculation is exact, so all configs still emit identical text).
 - **GPU utilisation** is NVML's "time a kernel was running" — a busy-ness signal, not FLOP efficiency.
 
 A local smoke run (Apple M2, MPS, Qwen2-0.5B, 16 requests) already shows the shape of the results: continuous batching **3.6×** HF sequential throughput, prefix caching **2×** on the shared-prefix workload. Real GPU numbers come from the Colab notebook.
