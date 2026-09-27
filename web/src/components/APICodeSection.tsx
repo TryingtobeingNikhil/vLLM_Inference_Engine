@@ -6,7 +6,7 @@ import { Badge } from '@/components/ui/Badge';
 import { Card } from '@/components/ui/Card';
 import { Reveal } from '@/components/ui/Reveal';
 import { CodeBlock, CopyButton } from '@/components/ui/CodeBlock';
-import { ENGINE_CONFIG } from '@/data/benchmarks';
+import { ENGINE_DEFAULTS, ENGINE_PORT, DEFAULT_QUICKSTART_MODEL, COLAB_URL } from '@/data/engine';
 
 // ── Tab definitions ────────────────────────────────────────────────────────────
 
@@ -20,149 +20,108 @@ interface Tab {
 
 const TABS: Tab[] = [
   {
-    id: 'curl',
-    label: 'cURL',
+    id: 'stream',
+    label: 'cURL · SSE',
     lang: 'bash',
-    file: 'generate.sh',
-    code: `# POST /generate — single request
-curl -s -X POST http://localhost:8000/generate \\
-  -H "Content-Type: application/json" \\
-  -d '{
-    "prompt": "Explain paged attention in one sentence:",
-    "max_new_tokens": 64
-  }' | jq .
+    file: 'stream.sh',
+    code: `# Start the engine on :${ENGINE_PORT}
+MODEL_NAME=${DEFAULT_QUICKSTART_MODEL} \\
+  python -m uvicorn inference_engine.server.app_v2:app --port ${ENGINE_PORT}
 
-# Response
-# {
-#   "request_id": "req-0001",
-#   "generated_text": "Paged attention …",
-#   "tokens_generated": 64,
-#   "ttft_ms": 16.5,
-#   "total_latency_ms": 514.4,
-#   "throughput_tps": 97.3
-# }`,
+# POST /generate with "stream": true → Server-Sent Events
+curl -N localhost:${ENGINE_PORT}/generate -H 'content-type: application/json' \\
+  -d '{"prompt": "Explain paged attention in one sentence.",
+       "max_new_tokens": 64, "stream": true}'
+
+# data: {"token_ids": [...], "text": "Paged"}        ← one event per step
+# data: {"token_ids": [...], "text": " attention"}
+# ...
+# data: {"done": true, "ttft_ms": ..., "tpot_ms": ..., "finish_reason": ...}
+# data: [DONE]`,
+  },
+  {
+    id: 'openai',
+    label: 'OpenAI',
+    lang: 'python',
+    file: 'openai_client.py',
+    code: `from openai import OpenAI
+
+# PageServe speaks the OpenAI completions API on /v1/completions
+client = OpenAI(base_url="http://localhost:${ENGINE_PORT}/v1", api_key="unused")
+
+stream = client.completions.create(
+    model="${DEFAULT_QUICKSTART_MODEL}",
+    prompt="Write a haiku about KV caches.",
+    max_tokens=64,
+    temperature=0.0,  # greedy (speculative decoding applies to greedy requests)
+    stream=True,      # OpenAI chunks, ending with a usage chunk
+)
+for chunk in stream:
+    print(chunk.choices[0].text, end="", flush=True)`,
   },
   {
     id: 'python',
     label: 'Python',
     lang: 'python',
-    file: 'client.py',
-    code: `import asyncio, aiohttp
+    file: 'sse_client.py',
+    code: `import asyncio, json, httpx
 
-async def generate(prompt: str, max_new_tokens: int = 64) -> dict:
-    async with aiohttp.ClientSession() as session:
-        async with session.post(
-            "http://localhost:8000/generate",
-            json={"prompt": prompt, "max_new_tokens": max_new_tokens},
-            timeout=aiohttp.ClientTimeout(total=30),
-        ) as resp:
-            resp.raise_for_status()
-            return await resp.json()
+async def stream(prompt: str, max_new_tokens: int = 64) -> dict:
+    body = {"prompt": prompt, "max_new_tokens": max_new_tokens, "stream": True}
+    async with httpx.AsyncClient(timeout=None) as client:
+        async with client.stream("POST", "http://localhost:${ENGINE_PORT}/generate", json=body) as resp:
+            async for line in resp.aiter_lines():
+                if not line.startswith("data: ") or line == "data: [DONE]":
+                    continue
+                event = json.loads(line[len("data: "):])
+                if event.get("done"):
+                    return event          # full result: ttft_ms, tpot_ms, ...
+                print(event["text"], end="", flush=True)
 
 async def main():
-    # Fire 4 requests concurrently — PageServe batches them automatically
-    results = await asyncio.gather(*[
-        generate("Explain KV caching:", max_new_tokens=50)
-        for _ in range(${ENGINE_CONFIG.max_batch_size})
-    ])
+    # Concurrent requests share every forward pass: continuous batching
+    results = await asyncio.gather(*[stream("Explain KV caching:") for _ in range(8)])
     for r in results:
-        print(f"ttft={r['ttft_ms']:.1f}ms  tps={r['throughput_tps']:.1f}")
+        print(f"\\nttft={r['ttft_ms']:.1f}ms  tpot={r['tpot_ms']:.1f}ms")
 
 asyncio.run(main())`,
   },
   {
-    id: 'typescript',
-    label: 'TypeScript',
-    lang: 'typescript',
-    file: 'client.ts',
-    code: `interface GenerateRequest {
-  prompt: string;
-  max_new_tokens?: number;
-}
-
-interface GenerateResponse {
-  request_id: string;
-  generated_text: string;
-  tokens_generated: number;
-  ttft_ms: number;
-  total_latency_ms: number;
-  throughput_tps: number;
-}
-
-async function generate(req: GenerateRequest): Promise<GenerateResponse> {
-  const res = await fetch("http://localhost:8000/generate", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(req),
-  });
-  if (!res.ok) throw new Error(\`HTTP \${res.status}\`);
-  return res.json();
-}
-
-// Concurrent batch — scheduler merges these automatically
-const results = await Promise.all(
-  Array.from({ length: 4 }, () =>
-    generate({ prompt: "What is continuous batching?", max_new_tokens: 50 })
-  )
-);
-console.log(results.map((r) => \`\${r.ttft_ms.toFixed(1)} ms TTFT\`));`,
-  },
-  {
     id: 'health',
-    label: 'Health',
+    label: 'Health · Metrics',
     lang: 'bash',
-    file: 'health.sh',
-    code: `# GET /health — liveness probe
-curl http://localhost:8000/health
+    file: 'observe.sh',
+    code: `# GET /health: model, device, batch occupancy, queue depth,
+#              KV block usage, enabled features
+curl localhost:${ENGINE_PORT}/health
 
-# {
-#   "status": "ok",
-#   "model": "${ENGINE_CONFIG.model_name}",
-#   "max_batch_size": ${ENGINE_CONFIG.max_batch_size},
-#   "kv_blocks_free": 198,
-#   "kv_blocks_total": ${ENGINE_CONFIG.kv_num_blocks},
-#   "cpu_blocks_total": ${ENGINE_CONFIG.kv_num_cpu_blocks},
-#   "queue_depth": 0
-# }
-
-# GET /metrics — Prometheus-compatible counters
-curl http://localhost:8000/metrics
-
-# pageserve_requests_total 42
-# pageserve_tokens_generated_total 2100
-# pageserve_ttft_ms_sum 872.0
-# pageserve_throughput_tps 97.25`,
+# GET /metrics: one JSON document with
+#   system                 in-flight, waiting, throughput
+#   e2e_latency            TTFT / TPOT / ITL / E2E / queue, p50–p99
+#   engine                 KV blocks, prefix hit rate, preemptions
+#   speculative_decoding   acceptance, tokens per step
+#   engine_steps           avg batch size, tokens/step, KV util, step latency
+#   gpu_memory · paged_kv_cache · cpu_swap · queue_stats · slo_compliance
+curl localhost:${ENGINE_PORT}/metrics`,
   },
 ];
 
-// ── Engine config rows ─────────────────────────────────────────────────────────
-
-const CONFIG_ROWS: { key: string; value: string | number; note: string }[] = [
-  { key: 'model_name',            value: ENGINE_CONFIG.model_name,            note: 'HuggingFace model id' },
-  { key: 'max_batch_size',        value: ENGINE_CONFIG.max_batch_size,        note: 'Max seqs in flight' },
-  { key: 'kv_block_size',         value: ENGINE_CONFIG.kv_block_size,         note: 'Tokens per KV block' },
-  { key: 'kv_num_blocks',         value: ENGINE_CONFIG.kv_num_blocks,         note: 'GPU KV pool capacity' },
-  { key: 'kv_num_cpu_blocks',     value: ENGINE_CONFIG.kv_num_cpu_blocks,     note: 'CPU swap pool capacity' },
-  { key: 'prefill_chunk_size',    value: ENGINE_CONFIG.prefill_chunk_size,    note: 'Tokens per prefill chunk' },
-  { key: 'prefill_budget_tokens', value: ENGINE_CONFIG.prefill_budget_tokens, note: 'Max prefill tok per iter' },
-  { key: 'decode_batch_limit',    value: ENGINE_CONFIG.decode_batch_limit,    note: 'Max decode seqs per iter' },
-];
-
-const QUICK_START = `git clone https://github.com/TryingtobeingNikhil/vLLM_Inference_Engine
+const QUICK_START = `git clone https://github.com/TryingtobeingNikhil/vLLM_Inference_Engine.git
 cd vLLM_Inference_Engine
 pip install -r requirements.txt
-python -m uvicorn inference_engine.server.app:app --port 8000`;
+MODEL_NAME=${DEFAULT_QUICKSTART_MODEL} python -m uvicorn inference_engine.server.app_v2:app --port ${ENGINE_PORT}`;
 
 const ENDPOINTS = [
-  { method: 'POST', path: '/generate', color: '#60A5FA', note: 'Inference' },
-  { method: 'GET',  path: '/health',   color: '#4ADE80', note: 'Liveness' },
-  { method: 'GET',  path: '/metrics',  color: '#A78BFA', note: 'Prometheus' },
+  { method: 'POST', path: '/generate',       color: '#60A5FA', note: 'Native · SSE' },
+  { method: 'POST', path: '/v1/completions', color: '#22D3EE', note: 'OpenAI' },
+  { method: 'GET',  path: '/health',         color: '#4ADE80', note: 'Liveness' },
+  { method: 'GET',  path: '/metrics',        color: '#A78BFA', note: 'p50–p99' },
 ];
 
 // ── Component ──────────────────────────────────────────────────────────────────
 
 export function APICodeSection() {
-  const [activeTab, setActiveTab] = useState<string>('curl');
+  const [activeTab, setActiveTab] = useState<string>('stream');
   const tabRefs = useRef<Record<string, HTMLButtonElement | null>>({});
   const [underline, setUnderline] = useState({ left: 0, width: 0 });
 
@@ -177,10 +136,10 @@ export function APICodeSection() {
     <section id="api" className="relative px-5 py-24 sm:px-6 sm:py-32">
       <div className="mx-auto max-w-5xl">
         <SectionHeader
-          index="07"
+          index="09"
           label="HTTP API"
-          title={<>Talk to it over <Accent gradient>plain HTTP.</Accent></>}
-          subtitle={`POST /generate · GET /health · GET /metrics — serving ${ENGINE_CONFIG.model_name} on port 8000.`}
+          title={<>Stream it, <Accent gradient>or talk OpenAI.</Accent></>}
+          subtitle={`Native /generate with SSE streaming, an OpenAI-compatible /v1/completions, /health and /metrics, on port ${ENGINE_PORT}. Client disconnects free KV memory. The Phase 1 baseline still runs on :8000.`}
         />
 
         <div className="grid gap-5 lg:grid-cols-[1fr_300px] [&>*]:min-w-0">
@@ -252,13 +211,18 @@ export function APICodeSection() {
 
             <Reveal delay={140}>
               <Card pad={false} glow={false}>
-                <p className="border-b border-line px-4 py-3 font-mono text-[10.5px] uppercase tracking-[0.16em] text-fg-3">Engine config</p>
+                <div className="flex items-baseline justify-between border-b border-line px-4 py-3">
+                  <p className="font-mono text-[10.5px] uppercase tracking-[0.16em] text-fg-3">Config defaults</p>
+                  <p className="font-mono text-[9.5px] text-fg-4">CUDA · MPS/CPU</p>
+                </div>
                 <dl className="divide-y divide-line">
-                  {CONFIG_ROWS.map((row) => (
+                  {ENGINE_DEFAULTS.map((row) => (
                     <div key={row.key} className="group px-4 py-2" title={row.note}>
                       <div className="flex items-baseline justify-between gap-3">
-                        <dt className="font-mono text-[11px] text-fg-3 transition-colors group-hover:text-fg-2">{row.key}</dt>
-                        <dd className="truncate font-mono text-[11.5px] text-fg">{row.value}</dd>
+                        <dt className="truncate font-mono text-[10.5px] text-fg-3 transition-colors group-hover:text-fg-2">{row.key}</dt>
+                        <dd className="shrink-0 font-mono text-[11px] text-fg">
+                          {row.cuda === row.other || row.other === '—' ? row.cuda : <>{row.cuda}<span className="text-fg-4"> · </span>{row.other}</>}
+                        </dd>
                       </div>
                     </div>
                   ))}
@@ -277,6 +241,15 @@ export function APICodeSection() {
                     <div key={l} className="whitespace-pre-wrap break-all pl-3.5 -indent-3.5"><span className="select-none text-mint">$ </span>{l.replace('https://github.com/TryingtobeingNikhil/', '…/')}</div>
                   ))}
                 </pre>
+                <a
+                  href={COLAB_URL}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="group flex items-center justify-between border-t border-line px-4 py-2.5 text-[12.5px] text-fg-2 transition-colors hover:bg-white/[0.02] hover:text-fg"
+                >
+                  <span>No GPU? Run it on Colab</span>
+                  <span className="transition-transform duration-300 group-hover:translate-x-0.5">↗</span>
+                </a>
               </Card>
             </Reveal>
           </div>

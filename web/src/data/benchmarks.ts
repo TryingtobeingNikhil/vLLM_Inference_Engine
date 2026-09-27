@@ -1,12 +1,17 @@
 /**
- * benchmarks.ts — Real measured numbers from PageServe benchmark runs.
+ * benchmarks.ts — v2 (legacy) numbers, Apple M2.
  *
- * Sources:
+ * These were measured on the v2 engine, before the v3 rewrite (PR #4). In v2
+ * every request ran its own forward pass and the paged pool was only a shadow
+ * copy, so these numbers do NOT describe the current engine. They are kept for
+ * history and shown on the site under a "v2 (legacy), Apple M2" label.
+ * Current results live in gpuBenchmarks.ts.
+ *
+ * Sources (now in benchmarks/legacy/ and the repo root):
  *   bench_direct_results.json   — single-request + 4-way concurrent
  *   bench_phases_results.json   — phase-by-phase comparison
  *   baseline_metrics.json       — sequential baseline per-request trace
- *   benchmark_comparison.md     — Before/After PR comparison
- *   baseline_metrics.md         — narrative summary
+ *   benchmark_comparison.md     — Before/After PR #1 comparison
  *
  * Hardware: Apple M2 (MPS), Qwen/Qwen2-0.5B, float16
  */
@@ -63,12 +68,6 @@ export const CHUNKED_PREFILL = {
   delay_saved_ms: 108.5,
 } as const;
 
-export const PHASE8_DECODE = {
-  live_ms_per_step: 10.0,
-  live_tps: 99.6,
-  reconstruct_ms_per_step: 0.66,
-  live_tps_before: 85.9,
-} as const;
 
 // ── Sequential baseline per-request trace (baseline_metrics.json) ────────────
 
@@ -140,22 +139,8 @@ export const PR_COMPARISON = {
   },
 } as const;
 
-// ── Engine configuration constants (inference_engine/config.py) ──────────────
 
-export const ENGINE_CONFIG = {
-  model_name: 'Qwen/Qwen2-0.5B',
-  max_batch_size: 4,
-  kv_block_size: 16,
-  kv_num_blocks: 256,
-  kv_num_cpu_blocks: 128,
-  prefill_budget_tokens: 512,
-  decode_batch_limit: 8,
-  prefill_chunk_size: 128,
-  request_timeout_ms: 30_000,
-  scheduler_poll_interval_ms: 1.0,
-} as const;
-
-// ── TTFT comparison — the headline numbers ────────────────────────────────────
+// ── v2 TTFT comparison (legacy) ────────────────────────────────────
 
 /** TTFT experienced by a late-arriving request under 4-way load in Phase 1 */
 export const TTFT_SEQUENTIAL_UNDER_LOAD_MS = 1418.0;

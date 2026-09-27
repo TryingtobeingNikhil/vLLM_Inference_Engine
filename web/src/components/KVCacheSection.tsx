@@ -7,7 +7,7 @@ import { Card, Window } from '@/components/ui/Card';
 import { Reveal } from '@/components/ui/Reveal';
 import { CodeBlock } from '@/components/ui/CodeBlock';
 import { SEQ_COLORS, useInView, usePrefersReducedMotion } from '@/lib/motion';
-import { ENGINE_CONFIG } from '@/data/benchmarks';
+import { DEMO_CONFIG as ENGINE_CONFIG } from '@/data/engine';
 import { buildBlockGridTrace, type BlockGridState, type BlockState } from '@/data/simulation';
 
 const TRACE = buildBlockGridTrace(80);
@@ -23,11 +23,14 @@ const PAGED_UTIL = Math.round(
     100,
 );
 
-const ALLOCATOR_SRC = `class BlockAllocator:
-    def allocate(seq_id, n_blocks) -> list[int]
-    def write_token(seq_id, count=1) -> None
-    def free(seq_id) -> None
-    # Thread-safe via threading.Lock`;
+const ALLOCATOR_SRC = `class BlockAllocator:  # block tables, ref counts, prefix cache
+    def allocate(seq_id, num_blocks=1) -> list[int]
+    def ensure_capacity(seq_id, total_tokens) -> list[int]
+    def register_computed_blocks(seq_id, token_ids, num_computed_tokens)
+    def free(seq_id) -> int
+
+# attention_wrapper.py — where each token's K/V lives in the pool
+slot = block_table[pos // 16] * 16 + pos % 16`;
 
 export function KVCacheSection() {
   const [frameIdx, setFrameIdx] = useState(0);
@@ -56,9 +59,9 @@ export function KVCacheSection() {
       <div className="mx-auto max-w-5xl">
         <SectionHeader
           index="03"
-          label="Phase 6–7 · Paged KV cache"
+          label="Phase 6–8 · Paged KV cache"
           title={<>Virtual memory for attention: <Accent gradient>pages, not slabs.</Accent></>}
-          subtitle={`${ENGINE_CONFIG.kv_num_blocks} blocks × ${ENGINE_CONFIG.kv_block_size} token slots. Allocated on demand, freed on completion — no external fragmentation.`}
+          subtitle={`Fixed ${ENGINE_CONFIG.kv_block_size}-token blocks in one pre-allocated pool, and attention reads and writes it directly through per-sequence block tables. On CUDA the pool is sized from free GPU memory; the grid below is a small demo pool.`}
         />
 
         <div className="grid gap-5 lg:grid-cols-[1.05fr_1fr] [&>*]:min-w-0">
@@ -66,7 +69,7 @@ export function KVCacheSection() {
           <Reveal>
             <div ref={ref}>
               <Window
-                title={<>block pool <span className="text-fg-4">— {ENGINE_CONFIG.kv_num_blocks} blocks</span></>}
+                title={<>demo pool <span className="text-fg-4">— {ENGINE_CONFIG.kv_num_blocks} blocks</span></>}
                 right={
                   <>
                     <Badge label="Demo data" variant="demo" className="hidden sm:inline-flex" />
@@ -179,17 +182,16 @@ export function KVCacheSection() {
               <Card>
                 <p className="mb-3 font-mono text-[10px] uppercase tracking-[0.16em] text-fg-3">Engineering decision</p>
                 <p className="mb-3 text-[14px] leading-relaxed text-fg-2">
-                  Standard Transformers allocate memory for{' '}
-                  <code className="rounded bg-white/5 px-1 font-mono text-[0.85em] text-fg">max_sequence_length</code> upfront,
-                  regardless of actual output length. Because output lengths are unpredictable, this causes{' '}
-                  <span className="text-amber">60–80% internal fragmentation</span> under typical workloads.
+                  Reserving <code className="rounded bg-white/5 px-1 font-mono text-[0.85em] text-fg">max_length</code> of KV per
+                  sequence up front <span className="text-amber">leaves most of it unused</span>, because output lengths are
+                  unpredictable, so few sequences fit.
                 </p>
                 <p className="text-[14px] leading-relaxed text-fg-2">
-                  PageServe&apos;s <code className="rounded bg-white/5 px-1 font-mono text-[0.85em] text-fg">BlockAllocator</code> maps
-                  each sequence&apos;s tokens into <span className="text-mint">{BS}-token logical blocks</span> backed by
-                  pre-allocated physical tensor slots in{' '}
-                  <code className="rounded bg-white/5 px-1 font-mono text-[0.85em] text-fg">PagedKVCacheManager</code>. Blocks are
-                  freed the moment a sequence completes.
+                  PageServe&apos;s <code className="rounded bg-white/5 px-1 font-mono text-[0.85em] text-fg">BlockAllocator</code> gives
+                  each sequence a block table of <span className="text-mint">{BS}-token blocks</span> in one device pool. A custom
+                  attention backend plugged into the HuggingFace model scatters new K/V into those slots and attends through the
+                  table, so there is <span className="text-fg">no per-sequence past_key_values</span>. Full blocks are
+                  content-hashed and ref-counted, so requests with a shared prefix share them.
                 </p>
               </Card>
             </Reveal>

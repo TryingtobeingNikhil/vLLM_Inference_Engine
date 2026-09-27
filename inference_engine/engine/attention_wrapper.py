@@ -34,9 +34,10 @@ Two attention paths
 -------------------
 * **Short queries** (decode = 1 token, speculative verification = k+1
   tokens, tiny prompts) — all such sequences are batched: gather every
-  sequence's context from the pool into ``[B, C, H_kv, D]`` and compute
-  masked attention with two batched matmuls.  GQA is handled by grouping
-  query heads per KV head instead of materialising repeated KV.
+  sequence's context from the pool into ``[B, C, H_kv, D]`` and run one
+  masked ``scaled_dot_product_attention``.  GQA is handled by folding the
+  query heads that share a KV head into the query axis instead of
+  materialising repeated KV.
 * **Long queries** (prefill chunks) — one ``scaled_dot_product_attention``
   call per sequence.  A chunk with no cached prefix attends only to itself,
   so it uses SDPA's fused causal kernel directly on the new K/V.
@@ -152,32 +153,35 @@ def _short_query_attention(
     scale: float,
     sliding_window: Optional[int],
 ) -> torch.Tensor:
-    """Batched attention for a slice of short-query sequences.  Returns [B, Q, H, D]."""
+    """Batched attention for a slice of short-query sequences.  Returns [B, Q, H, D].
+
+    GQA without copying K/V: the G query heads that share a KV head are
+    folded into the query-length axis, so SDPA sees H_kv "heads" whose
+    queries are [Q × G] rows.  SDPA's fused kernels accumulate in fp32 —
+    important for fp16 models, where rounding the raw attention scores to
+    fp16 before softmax visibly perturbs the output.
+    """
     idx = meta.short_token_idx[rows]               # [B, Q]
     bsz, qlen = idx.shape
     num_heads, head_dim = q.shape[1], q.shape[2]
     num_kv_heads = k_cache.shape[2]
     group = num_heads // num_kv_heads
 
-    # Gather each sequence's context through its block table: [B, C, H_kv, D]
+    # Gather each sequence's context through its block table → [B, H_kv, C, D]
     tables = meta.short_block_tables[rows]
     num_slots = tables.shape[1] * meta.block_size
-    keys = k_cache[tables].view(bsz, num_slots, num_kv_heads, head_dim)
-    values = v_cache[tables].view(bsz, num_slots, num_kv_heads, head_dim)
+    keys = k_cache[tables].view(bsz, num_slots, num_kv_heads, head_dim).transpose(1, 2)
+    values = v_cache[tables].view(bsz, num_slots, num_kv_heads, head_dim).transpose(1, 2)
 
-    # Group query heads by the KV head they share (GQA) → [B, H_kv, Q*G, D]
-    qs = (q[idx] * scale).view(bsz, qlen, num_kv_heads, group, head_dim)
+    # [B, Q, H, D] → [B, H_kv, Q*G, D]   (row = q * G + g)
+    qs = q[idx].view(bsz, qlen, num_kv_heads, group, head_dim)
     qs = qs.permute(0, 2, 1, 3, 4).reshape(bsz, num_kv_heads, qlen * group, head_dim)
 
-    scores = torch.matmul(qs, keys.permute(0, 2, 3, 1))           # [B, H_kv, Q*G, C]
-    if scores.dtype in (torch.float16, torch.bfloat16):
-        scores = scores.float()   # softmax in fp32 for half-precision models
     mask = meta.short_kv_mask(sliding_window)[rows]                # [B, Q, C]
     mask = mask.unsqueeze(1).unsqueeze(3).expand(bsz, 1, qlen, group, num_slots)
-    scores.masked_fill_(~mask.reshape(bsz, 1, qlen * group, num_slots), float("-inf"))
-    probs = torch.softmax(scores, dim=-1).to(values.dtype)
+    mask = mask.reshape(bsz, 1, qlen * group, num_slots)
 
-    out = torch.matmul(probs, values.permute(0, 2, 1, 3))          # [B, H_kv, Q*G, D]
+    out = F.scaled_dot_product_attention(qs, keys, values, attn_mask=mask, scale=scale)
     out = out.view(bsz, num_kv_heads, qlen, group, head_dim).permute(0, 2, 1, 3, 4)
     return out.reshape(bsz, qlen, num_heads, head_dim)
 

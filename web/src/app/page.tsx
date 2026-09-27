@@ -10,6 +10,8 @@ import { PhaseBuildLogSection }  from '@/components/PhaseBuildLogSection';
 import { BenchmarksSection }     from '@/components/BenchmarksSection';
 import { APICodeSection }        from '@/components/APICodeSection';
 import { GitHubFooter }          from '@/components/GitHubFooter';
+import { V3FeaturesSection }    from '@/components/V3FeaturesSection';
+import { TestedSection }        from '@/components/TestedSection';
 
 // Re-fetch GitHub stats at most once an hour (ISR).
 export const revalidate = 3600;
@@ -25,28 +27,34 @@ export default async function HomePage() {
         {/* § 0 — Hero + live scheduler panel */}
         <HeroSection />
 
-        {/* § 1 — Scheduler loop architecture */}
+        {/* § 1 — Scheduler step: one packed forward pass */}
         <SchedulerLiveSection />
 
-        {/* § 2 — Phase 1 (sequential) vs Phase 2–9 (continuous batching) */}
+        {/* § 2 — Sequential vs batched (v2 legacy replay + v3 smoke numbers) */}
         <Phase1vs2Section />
 
         {/* § 3 — Paged KV cache visualisation */}
         <KVCacheSection />
 
-        {/* § 4 — CPU swap pool under memory pressure */}
+        {/* § 4 — Preemption under memory pressure (swap / recompute) */}
         <CPUSwapSection />
 
-        {/* § 5 — 11-phase build log timeline */}
+        {/* § 5 — New in v3: prefix caching, speculation, streaming, metrics */}
+        <V3FeaturesSection />
+
+        {/* § 6 — 12-phase build log timeline */}
         <PhaseBuildLogSection />
 
-        {/* § 6 — Measured benchmark numbers */}
+        {/* § 7 — Where it's been tested + Colab */}
+        <TestedSection />
+
+        {/* § 8 — Measured results (data/gpuBenchmarks.ts) + v2 legacy */}
         <BenchmarksSection />
 
-        {/* § 7 — HTTP API usage examples */}
+        {/* § 9 — HTTP API usage examples */}
         <APICodeSection />
 
-        {/* § 8 — Footer */}
+        {/* § 10 — Footer */}
         <GitHubFooter />
       </main>
     </RepoStatsProvider>

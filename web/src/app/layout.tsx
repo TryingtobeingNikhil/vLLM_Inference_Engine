@@ -15,20 +15,20 @@ const serif = Instrument_Serif({
 export const metadata: Metadata = {
   title: 'PageServe — LLM Inference Engine',
   description:
-    'A production-grade LLM inference engine built from first principles: continuous batching, paged KV cache, chunked prefill, and CPU swap pool.',
+    'An LLM inference engine built from scratch: continuous batching over a paged KV cache, prefix caching, preemption and speculative decoding, in readable PyTorch.',
   // Favicons come from the file conventions in this folder:
   // icon.svg (modern browsers), favicon.ico (fallback), apple-icon.png (iOS/Safari).
   openGraph: {
     title: 'PageServe — LLM Inference Engine',
     description:
-      'Continuous batching, paged KV cache, chunked prefill — built without vLLM or HuggingFace generate.',
+      'One packed forward pass per step, paged attention through block tables, prefix caching, speculative decoding and an OpenAI-compatible API, built without vLLM.',
     type: 'website',
     images: ['/favicon.png'],
   },
   twitter: {
     card: 'summary',
     title: 'PageServe',
-    description: 'LLM inference engine built from first principles.',
+    description: 'LLM inference engine built from scratch: paged attention, prefix caching, speculative decoding.',
     images: ['/favicon.png'],
   },
 };

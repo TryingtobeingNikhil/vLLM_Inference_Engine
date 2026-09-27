@@ -7,7 +7,6 @@ import { Card, Window } from '@/components/ui/Card';
 import { Reveal } from '@/components/ui/Reveal';
 import { SEQ_COLORS, useInView, usePrefersReducedMotion } from '@/lib/motion';
 import { CPU_SWAP_EVENT_LOG, type SwapEventLogEntry } from '@/data/simulation';
-import { ENGINE_CONFIG } from '@/data/benchmarks';
 
 const EVENT_COLORS: Record<SwapEventLogEntry['type'], string> = {
   admit:    '#60A5FA',
@@ -21,7 +20,7 @@ const EVENT_COLORS: Record<SwapEventLogEntry['type'], string> = {
 
 const EVENT_PREFIX: Record<SwapEventLogEntry['type'], string> = {
   admit:    'ADMIT',
-  oom:      'OOM',
+  oom:      'FULL',
   swap_out: 'SWAPOUT',
   alloc:    'ALLOC',
   resume:   'SWAP IN',
@@ -29,47 +28,56 @@ const EVENT_PREFIX: Record<SwapEventLogEntry['type'], string> = {
   done:     'DONE',
 };
 
-// Pools drawn at 1 cell = 8 blocks: 32 GPU cells = 256 blocks, 16 CPU cells = 128 blocks.
-const GPU_CELLS = ENGINE_CONFIG.kv_num_blocks / 8;
-const CPU_CELLS = ENGINE_CONFIG.kv_num_cpu_blocks / 8;
+// A small demo pool so every block in the log is one cell on screen.
+const GPU_CELLS = 32;
+const CPU_CELLS = 16;
 
 interface PoolFrame {
   gpu: (string | null)[];
   cpu: (string | null)[];
-  ghost: number;          // cells requested by the incoming sequence that don't fit
-  victim: boolean;
+  need: { seq: string; blocks: number } | null; // a running sequence that can't grow
+  victim: string | null;
+  waiting: string[];
   transfer: 'down' | 'up' | null;
 }
 
-function fill(arr: (string | null)[], from: number, n: number, owner: string) {
+function fill(arr: (string | null)[], from: number, n: number, owner: string | null) {
   for (let i = from; i < from + n && i < arr.length; i++) arr[i] = owner;
 }
 
-/** Pool state after the first `k` log events have played — mirrors the block counts in the log. */
+/**
+ * Pool state after the first `k` log events have played (see CPU_SWAP_EVENT_LOG).
+ * FCFS admission + LIFO preemption: the new arrival never evicts anyone; the
+ * newest *running* sequence is swapped out when an older one can't grow.
+ */
 function frameFor(k: number): PoolFrame {
   const gpu: (string | null)[] = Array(GPU_CELLS).fill(null);
   const cpu: (string | null)[] = Array(CPU_CELLS).fill(null);
-  fill(gpu, 0, 8, 'a1b2');
-  fill(gpu, 8, 7, 'g7h8');
-  let ghost = 0, victim = false, transfer: PoolFrame['transfer'] = null;
+  const f: PoolFrame = { gpu, cpu, need: null, victim: null, waiting: [], transfer: null };
 
-  if (k < 5 || k === 8) fill(gpu, 15, 12, 'c3d4');       // victim resident on GPU
-  if (k === 3) ghost = 7;                                 // OOM: 7 requested, 5 free
-  if (k === 4) victim = true;
-  if (k >= 5 && k < 8) { fill(cpu, 0, 12, 'c3d4'); }      // parked in host RAM
-  if (k === 5) transfer = 'down';
-  if (k === 6) fill(gpu, 15, 7, 'e5f6');
-  if (k === 7) fill(gpu, 15, 8, 'e5f6');
-  if (k === 8) transfer = 'up';
-  if (k === 9) fill(gpu, 15, 13, 'c3d4');                 // k ≥ 10: finished, blocks freed
-  return { gpu, cpu, ghost, victim, transfer };
+  const a1b2Alive = k < 7;
+  if (a1b2Alive) fill(gpu, 0, 10, 'a1b2');                // oldest request
+  if (k < 10) fill(gpu, 10, 8, 'g7h8');
+  if (k < 5 || (k >= 8 && k < 10)) fill(gpu, 18, 12, 'c3d4'); // newest running request
+  if (k >= 2 && a1b2Alive) gpu[30] = 'a1b2';              // decodes grow into the last free blocks
+  if (k >= 2 && k < 10) gpu[31] = 'g7h8';
+  if (k >= 6 && a1b2Alive) gpu[18] = 'a1b2';              // a1b2's block after the swap
+  if (k >= 5 && k < 8) fill(cpu, 0, 12, 'c3d4');          // parked in pinned host RAM
+  if (k >= 9 && k < 10) fill(gpu, 0, 6, 'e5f6');          // admitted once blocks are free
+
+  if (k >= 1 && k < 9) f.waiting = ['e5f6'];
+  if (k === 3) f.need = { seq: 'a1b2', blocks: 1 };
+  if (k === 4) f.victim = 'c3d4';
+  if (k === 5) f.transfer = 'down';
+  if (k === 8) f.transfer = 'up';
+  return f;
 }
 
-function Pool({ cells, label, capacity, ghost = 0, victim = false }: { cells: (string | null)[]; label: string; capacity: number; ghost?: number; victim?: boolean }) {
+function Pool({ cells, label, capacity, need = null, victim = null }: { cells: (string | null)[]; label: string; capacity: number; need?: PoolFrame['need']; victim?: string | null }) {
   const used = cells.filter(Boolean).length;
   const pct = Math.round((used / cells.length) * 100);
   const free = cells.length - used;
-  const hot = ghost > 0;
+  const hot = need !== null;
   return (
     <div>
       <div className="mb-2 flex items-baseline justify-between font-mono text-[11px]">
@@ -83,19 +91,17 @@ function Pool({ cells, label, capacity, ghost = 0, victim = false }: { cells: (s
         style={{ gridTemplateColumns: `repeat(${Math.min(cells.length, 16)}, 1fr)` }}
       >
         {cells.map((owner, i) => {
-          const isGhost = !owner && hot && i >= used && i < used + Math.min(ghost, free);
-          const isVictim = victim && owner === 'c3d4';
+          const isVictim = victim !== null && owner === victim;
+          const isNeedy = hot && owner === need.seq;
           const color = owner ? SEQ_COLORS[owner] : null;
           return (
             <div
               key={i}
               className={`aspect-square rounded-[4px] transition-all duration-500 ${isVictim ? 'animate-pulse' : ''}`}
               style={{
-                backgroundColor: color ? `${color}${isVictim ? '55' : '40'}` : isGhost ? 'rgba(251,113,133,0.18)' : 'rgba(255,255,255,0.03)',
+                backgroundColor: color ? `${color}${isVictim ? '55' : '40'}` : 'rgba(255,255,255,0.03)',
                 boxShadow: color
-                  ? `inset 0 0 0 1px ${isVictim ? '#FB7185' : `${color}99`}`
-                  : isGhost
-                  ? 'inset 0 0 0 1px rgba(251,113,133,0.7)'
+                  ? `inset 0 0 0 1px ${isVictim ? '#FB7185' : isNeedy ? color : `${color}99`}${isNeedy ? `, 0 0 8px ${color}88` : ''}`
                   : 'inset 0 0 0 1px rgba(255,255,255,0.04)',
                 transform: color ? 'scale(1)' : 'scale(0.86)',
               }}
@@ -104,7 +110,9 @@ function Pool({ cells, label, capacity, ghost = 0, victim = false }: { cells: (s
         })}
       </div>
       {hot && (
-        <p className="mt-1.5 text-right font-mono text-[10px] text-rose">seq-e5f6 needs 7 · only {free} free</p>
+        <p className="mt-1.5 text-right font-mono text-[10px] text-rose">
+          seq-{need.seq} needs {need.blocks} more · {free} free
+        </p>
       )}
     </div>
   );
@@ -149,9 +157,9 @@ export function CPUSwapSection() {
       <div className="mx-auto max-w-5xl">
         <SectionHeader
           index="04"
-          label="Phase 9 · CPU swap manager"
-          title={<>Out of blocks? <Accent gradient>Swap, don&apos;t drop.</Accent></>}
-          subtitle="When GPU blocks run out, PageServe preempts the largest sequence and parks its KV-cache in host RAM — instead of failing the request."
+          label="Phase 9 · Preemption"
+          title={<>Out of blocks? <Accent gradient>Preempt, don&apos;t drop.</Accent></>}
+          subtitle="FCFS admission, LIFO preemption. A new request waits for free blocks instead of evicting anyone. When a running sequence can’t grow, the most recently arrived one is preempted: swapped to pinned CPU memory if it’s decoding, otherwise dropped and recomputed later."
         />
 
         <div ref={ref} className="grid gap-5 lg:grid-cols-2 [&>*]:min-w-0">
@@ -160,11 +168,27 @@ export function CPUSwapSection() {
             <Window
               className="flex h-full flex-col"
               bodyClassName="flex flex-1 flex-col"
-              title={<>burst scenario <span className="text-fg-4">— replay</span></>}
+              title={<>memory pressure <span className="text-fg-4">— replay</span></>}
               right={<Badge label="Demo data" variant="demo" />}
             >
               <div className="flex flex-1 flex-col p-5">
-                <Pool cells={frame.gpu} label="GPU block pool" capacity={ENGINE_CONFIG.kv_num_blocks} ghost={frame.ghost} victim={frame.victim} />
+                <div className="mb-4 flex min-h-[26px] items-center gap-2 font-mono text-[11px]">
+                  <span className="text-fg-3">waiting</span>
+                  {frame.waiting.length ? (
+                    frame.waiting.map((id) => (
+                      <span
+                        key={id}
+                        className="rounded-full border px-2 py-0.5 [animation:log-in_0.4s_var(--ease-out)_both]"
+                        style={{ color: SEQ_COLORS[id], borderColor: `${SEQ_COLORS[id]}55`, backgroundColor: `${SEQ_COLORS[id]}12` }}
+                      >
+                        seq-{id} · FCFS
+                      </span>
+                    ))
+                  ) : (
+                    <span className="text-fg-4">—</span>
+                  )}
+                </div>
+                <Pool cells={frame.gpu} label="GPU block pool" capacity={GPU_CELLS} need={frame.need} victim={frame.victim} />
 
                 {/* Transfer lane */}
                 <div className="relative my-3 flex h-14 items-center justify-center">
@@ -194,9 +218,9 @@ export function CPUSwapSection() {
                   </span>
                 </div>
 
-                <Pool cells={frame.cpu} label="CPU staging pool" capacity={ENGINE_CONFIG.kv_num_cpu_blocks} />
+                <Pool cells={frame.cpu} label="CPU swap pool (pinned)" capacity={CPU_CELLS} />
 
-                <p className="mb-5 mt-3 font-mono text-[10px] text-fg-4">1 cell = 8 blocks</p>
+                <p className="mb-5 mt-3 font-mono text-[10px] text-fg-4">Small demo pool: real pools are sized from free GPU memory.</p>
 
                 <button
                   onClick={startReplay}
@@ -206,7 +230,7 @@ export function CPUSwapSection() {
                   {isRunning ? (
                     <><span className="h-1.5 w-1.5 animate-pulse rounded-full bg-mint" /> Replaying… {visibleCount}/{CPU_SWAP_EVENT_LOG.length}</>
                   ) : (
-                    <><span className="inline-block transition-transform duration-500 group-hover:-rotate-180">↺</span> Replay burst scenario</>
+                    <><span className="inline-block transition-transform duration-500 group-hover:-rotate-180">↺</span> Replay scenario</>
                   )}
                 </button>
               </div>
@@ -218,7 +242,7 @@ export function CPUSwapSection() {
             <Reveal delay={80}>
               <Window title={<>scheduler.log <span className="text-fg-4">— tail -f</span></>}>
                 <div ref={logRef} className="h-56 overflow-y-auto px-4 py-3 font-mono text-[11px] leading-[1.9]">
-                  {visibleCount === 0 && <p className="text-fg-4">$ waiting for burst…</p>}
+                  {visibleCount === 0 && <p className="text-fg-4">$ waiting for memory pressure…</p>}
                   {CPU_SWAP_EVENT_LOG.slice(0, visibleCount).map((ev, i) => (
                     <div key={i} className="flex items-start gap-3 [animation:log-in_0.4s_var(--ease-out)_both]">
                       <span className="shrink-0 tabular-nums text-fg-4">+{String(ev.timeMs).padStart(4, '0')}ms</span>
@@ -230,7 +254,7 @@ export function CPUSwapSection() {
                   ))}
                   {isRunning && <span className="animate-blink text-mint">▍</span>}
                   {done && !isRunning && (
-                    <p className="mt-1 text-mint">✓ 0 requests dropped · 0 HTTP 500s</p>
+                    <p className="mt-1 text-mint">✓ 0 requests dropped · oldest request never starved</p>
                   )}
                 </div>
               </Window>
@@ -239,9 +263,9 @@ export function CPUSwapSection() {
             <div className="grid grid-cols-2 gap-3">
               <Reveal delay={140}>
                 <Card className="h-full" glow={false}>
-                  <p className="mb-3 font-mono text-[10px] uppercase tracking-[0.14em] text-rose">Without swap</p>
+                  <p className="mb-3 font-mono text-[10px] uppercase tracking-[0.14em] text-rose">Without preemption</p>
                   <ul className="space-y-1.5">
-                    {['HTTP 500 on OOM', 'Request dropped', 'GPU crash', 'Work lost'].map((l) => (
+                    {['Out-of-memory error', 'Request dropped', 'Work lost', 'Client retries'].map((l) => (
                       <li key={l} className="flex items-center gap-2 text-[13px] text-fg-3">
                         <span className="text-rose">✕</span> {l}
                       </li>
@@ -253,7 +277,7 @@ export function CPUSwapSection() {
                 <Card className="h-full border-mint/20 bg-mint/[0.03]" glow={false}>
                   <p className="mb-3 font-mono text-[10px] uppercase tracking-[0.14em] text-mint">With PageServe</p>
                   <ul className="space-y-1.5">
-                    {['Victim preempted', 'KV → CPU RAM', 'New req admitted', 'Victim resumes'].map((l) => (
+                    {['Newest request preempted', 'Swap or recompute', 'Older requests keep going', 'Swapped work resumes first'].map((l) => (
                       <li key={l} className="flex items-center gap-2 text-[13px] text-fg-2">
                         <span className="text-mint">✓</span> {l}
                       </li>
@@ -267,10 +291,11 @@ export function CPUSwapSection() {
               <div className="flex gap-4 rounded-2xl border border-amber/20 bg-gradient-to-r from-amber/[0.07] to-transparent p-5">
                 <span className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-amber/15 font-mono text-sm text-amber">⚖</span>
                 <div>
-                  <p className="text-[14px] font-medium text-fg">Victim selection: biggest first, not LRU</p>
+                  <p className="text-[14px] font-medium text-fg">Victim selection: newest first (LIFO)</p>
                   <p className="mt-1 text-[13.5px] leading-relaxed text-fg-2">
-                    Pick the sequence holding the <span className="text-fg">most allocated blocks</span>. Freeing one large
-                    sequence is cheaper than evicting several small ones.
+                    FCFS admission plus LIFO preemption means old requests are never starved. A victim that is still prefilling isn&apos;t
+                    swapped: its blocks are dropped and it re-prefills later, usually cheaply, because its blocks stay in the
+                    prefix cache. Nothing new is admitted while swapped sequences wait.
                   </p>
                 </div>
               </div>

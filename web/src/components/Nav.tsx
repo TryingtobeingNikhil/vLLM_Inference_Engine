@@ -7,9 +7,11 @@ const LINKS = [
   { id: 'scheduler',  label: 'Scheduler' },
   { id: 'comparison', label: 'Batching' },
   { id: 'kvcache',    label: 'KV Cache' },
-  { id: 'swapping',   label: 'Swap' },
+  { id: 'swapping',   label: 'Preemption' },
+  { id: 'v3',         label: 'New in v3' },
   { id: 'phases',     label: 'Build log' },
-  { id: 'benchmarks', label: 'Benchmarks' },
+  { id: 'tested',     label: 'Tested' },
+  { id: 'benchmarks', label: 'Results' },
   { id: 'api',        label: 'API' },
 ];
 

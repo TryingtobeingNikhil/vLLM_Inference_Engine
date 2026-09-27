@@ -7,7 +7,8 @@ import { Card } from '@/components/ui/Card';
 import { Reveal } from '@/components/ui/Reveal';
 import { useInView, usePrefersReducedMotion } from '@/lib/motion';
 import { PHASE1_TIMELINE, PHASE2_TIMELINE, type TimelineBar } from '@/data/simulation';
-import { TTFT_SEQUENTIAL_UNDER_LOAD_MS, TTFT_BATCHED_UNDER_LOAD_MS } from '@/data/benchmarks';
+import { TTFT_BATCHED_UNDER_LOAD_MS } from '@/data/benchmarks';
+import { compareSystems } from '@/data/gpuBenchmarks';
 
 type Mode = 'phase1' | 'phase2';
 
@@ -116,7 +117,13 @@ export function Phase1vs2Section() {
           index="02"
           label="Phase comparison"
           title={<>Four requests. <Accent gradient>Two very different waits.</Accent></>}
-          subtitle="4 concurrent requests, 50 tokens each. The wall-clock scale is identical across both views — watch where the playhead is when the last request finishes."
+          subtitle={
+            <>
+              4 concurrent requests, 50 tokens each, replayed from the{' '}
+              <span className="text-fg">v2 (legacy) engine on an Apple M2</span>. Both views share one wall-clock scale: watch
+              where the playhead is when the last request finishes. v3 numbers from the same laptop are below the chart.
+            </>
+          }
         />
 
         <Reveal>
@@ -135,7 +142,7 @@ export function Phase1vs2Section() {
                 />
                 {[
                   { id: 'phase1' as Mode, prefix: 'Phase 1 · ', label: 'Sequential', on: 'text-rose' },
-                  { id: 'phase2' as Mode, prefix: 'Phase 2–9 · ', label: 'Batched', on: 'text-mint' },
+                  { id: 'phase2' as Mode, prefix: 'Phase 2+ · ', label: 'Batched', on: 'text-mint' },
                 ].map((tab) => (
                   <button
                     key={tab.id}
@@ -152,7 +159,7 @@ export function Phase1vs2Section() {
                 ))}
               </div>
               <div className="ml-auto flex items-center gap-2">
-                <Badge label="Benchmark replay" variant="demo" className="hidden sm:inline-flex" />
+                <Badge label="v2 (legacy) · Apple M2" variant="demo" className="hidden sm:inline-flex" />
                 <button
                   onClick={play}
                   className="group inline-flex items-center gap-1.5 rounded-full border border-line-2 px-3 py-1.5 font-mono text-[11px] text-fg-2 transition-colors hover:border-white/25 hover:text-fg"
@@ -214,18 +221,17 @@ export function Phase1vs2Section() {
           </div>
         </Reveal>
 
-        {/* Stat comparison cards */}
+        {/* v3 comparison cards — local smoke runs */}
         <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-3">
-          {[
-            { label: 'TTFT under 4-way load', before: `${TTFT_SEQUENTIAL_UNDER_LOAD_MS.toLocaleString()} ms`, after: `${TTFT_BATCHED_UNDER_LOAD_MS} ms`, delta: '−98.5%' },
-            { label: 'Wall clock (all done)', before: '5,673 ms', after: '3,990 ms', delta: '−29.6%' },
-            { label: 'Aggregate throughput', before: '42.0 tok/s', after: '50.1 tok/s', delta: '+19.3%' },
-          ].map((s, i) => (
+          {V3_CARDS.map((s, i) => (
             <Reveal key={s.label} delay={i * 90}>
               <StatDiff {...s} />
             </Reveal>
           ))}
         </div>
+        <p className="mt-2 font-mono text-[10.5px] text-fg-4">
+          v3 cards: small local smoke runs · Apple M2 (MPS) · Qwen2-0.5B fp16 · output tokens/s
+        </p>
 
         <Reveal>
           <AddRequestDemo mode={mode} />
@@ -234,6 +240,15 @@ export function Phase1vs2Section() {
     </section>
   );
 }
+
+const tokS = (v: number | null) => (v === null ? '–' : `${v.toFixed(1)} tok/s`);
+const times = (v: number | null) => (v === null ? '–' : `${v.toFixed(1)}×`);
+
+const V3_CARDS = [
+  { label: 'v3 · 8 concurrent × 64 tokens', cmp: compareSystems('m2-mps', 'concurrency/concurrent', 'hf_sequential', 'engine'), beforeLabel: 'HF sequential' },
+  { label: 'v3 · vs HF sequential (16 req)', cmp: compareSystems('m2-mps', 'batching/random', 'hf_sequential', 'engine'), beforeLabel: 'HF sequential' },
+  { label: 'v3 · vs HF static batching', cmp: compareSystems('m2-mps', 'batching/random', 'hf_static_batch', 'engine'), beforeLabel: 'static batching' },
+].map((c) => ({ label: c.label, before: `${c.beforeLabel} ${tokS(c.cmp.from)}`, after: tokS(c.cmp.to), delta: times(c.cmp.ratio) }));
 
 function StatDiff({ label, before, after, delta }: { label: string; before: string; after: string; delta: string }) {
   return (

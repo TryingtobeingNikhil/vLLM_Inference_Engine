@@ -1,23 +1,24 @@
 import { GitHubStats, StarButton, REPO_URL } from '@/components/GitHubStats';
 import { LogoMark } from '@/components/Nav';
 import { Reveal } from '@/components/ui/Reveal';
+import { COLAB_URL } from '@/data/engine';
 
 export function GitHubFooter() {
   const LINKS = [
     { label: 'Source',           href: REPO_URL },
     { label: 'Issues',           href: `${REPO_URL}/issues` },
     { label: 'README',           href: `${REPO_URL}/blob/main/README.md` },
-    { label: 'bench_direct',     href: `${REPO_URL}/blob/main/bench_direct_results.json` },
-    { label: 'bench_phases',     href: `${REPO_URL}/blob/main/bench_phases_results.json` },
-    { label: 'baseline_metrics', href: `${REPO_URL}/blob/main/baseline_metrics.json` },
+    { label: 'Colab notebook',   href: COLAB_URL },
+    { label: 'benchmarks/',      href: `${REPO_URL}/tree/main/benchmarks` },
+    { label: 'v2 legacy results', href: `${REPO_URL}/tree/main/benchmarks/legacy` },
   ];
 
   const TECH_STACK = [
-    'Python 3.11',
-    'PyTorch / MPS',
-    'FastAPI',
-    'asyncio',
-    'Qwen2-0.5B',
+    'Python 3.10+',
+    'PyTorch 2.3+',
+    'transformers 4.51–5.x',
+    'FastAPI · SSE',
+    'CUDA · MPS · CPU',
     'Next.js 14',
     'Tailwind CSS',
   ];
@@ -44,11 +45,11 @@ export function GitHubFooter() {
             <div className="mb-3 flex items-center gap-2.5">
               <LogoMark className="h-6 w-6" />
               <span className="text-lg font-semibold tracking-tight text-fg">PageServe</span>
-              <span className="rounded-full border border-line-2 px-2 py-0.5 font-mono text-[10px] text-fg-3">v0.1.0</span>
+              <span className="rounded-full border border-line-2 px-2 py-0.5 font-mono text-[10px] text-fg-3">v3</span>
             </div>
             <p className="mb-5 max-w-md text-[13.5px] leading-relaxed text-fg-3">
-              An LLM inference engine built from first principles — continuous batching, paged KV cache, chunked
-              prefill and CPU swap pool, implemented without vLLM or HuggingFace generate.
+              An LLM inference engine built from scratch: continuous batching over a paged KV cache, prefix caching,
+              preemption and speculative decoding, in readable PyTorch. One packed forward pass per step.
             </p>
             <div className="flex flex-wrap gap-1.5">
               {TECH_STACK.map((t) => (
@@ -95,7 +96,7 @@ export function GitHubFooter() {
         </div>
 
         <div className="mt-8 flex flex-wrap items-center justify-between gap-3 border-t border-line pt-6 font-mono text-[10.5px] text-fg-4">
-          <span>Apple M2 · Qwen/Qwen2-0.5B · float16 · MPS — all benchmarks measured on real hardware</span>
+          <span>Local results: Apple M2 (MPS, CPU) · GPU results via Colab: coming · nothing extrapolated</span>
           <div className="flex items-center gap-4">
             <span>© {new Date().getFullYear()} PageServe</span>
             <a href="#top" className="rounded-full border border-line px-2.5 py-1 text-fg-3 transition-colors hover:border-line-2 hover:text-fg">

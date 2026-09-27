@@ -1,6 +1,8 @@
 /**
- * phases.ts — 11-phase build log content.
- * Derived from README.md "Development Phases" section and benchmark data.
+ * phases.ts — 12-phase build log content.
+ * Derived from README.md "Development phases" and "How it works" (v3).
+ * Metrics tagged "v2, M2" are legacy measurements; "M2 smoke" are small local
+ * v3 runs (see gpuBenchmarks.ts).
  */
 
 export interface PhaseEntry {
@@ -13,6 +15,7 @@ export interface PhaseEntry {
   metricAfter?: string;
   metricLabel?: string;
   tag: 'scheduling' | 'memory' | 'observability' | 'testing';
+  isNew?: boolean;
 }
 
 export const PHASES: PhaseEntry[] = [
@@ -20,10 +23,10 @@ export const PHASES: PhaseEntry[] = [
     phase: 1,
     title: 'Sequential Serving Baseline',
     file: 'engine/sequential.py',
-    problem: 'One request at a time. asyncio.Lock serializes all generation. New arrivals block until prior request fully completes.',
-    solution: 'Establishes the ground truth baseline: a clean single-request HuggingFace generate() wrapper with per-token timing.',
-    metricLabel: 'TTFT (warm)',
-    metricAfter: '~32 ms',
+    problem: 'One request at a time. A lock serializes all generation, so new arrivals block until the previous request fully completes.',
+    solution: 'The ground-truth baseline: a naive prefill → decode loop around HuggingFace, with streaming. Its TTFT now includes the time spent waiting for the lock.',
+    metricLabel: 'Serves on',
+    metricAfter: ':8000 · app.py',
     tag: 'scheduling',
   },
   {
@@ -31,8 +34,8 @@ export const PHASES: PhaseEntry[] = [
     title: 'Continuous Batching Scheduler',
     file: 'engine/scheduler.py',
     problem: 'Head-of-line blocking: a 500-token request starves a 5-token request for its entire duration.',
-    solution: 'Background asyncio task runs a scheduler loop. Each iteration advances all active sequences by one decode token. No request monopolizes the GPU.',
-    metricLabel: 'TTFT under 4-way load',
+    solution: 'A background loop does iteration-level scheduling: plan → execute → apply. Requests join and leave the running batch between steps.',
+    metricLabel: 'TTFT under 4-way load (v2, M2)',
     metricBefore: '1,418 ms',
     metricAfter: '20.9 ms',
     tag: 'scheduling',
@@ -41,83 +44,101 @@ export const PHASES: PhaseEntry[] = [
     phase: 3,
     title: 'Request Queue',
     file: 'engine/request_queue.py',
-    problem: 'Concurrent clients overwhelm the scheduler — connections drop or race.',
-    solution: 'FIFO RequestQueue with configurable maxsize and per-request timeout. Returns HTTP 429 when full, TimeoutError on expiry.',
-    metricAfter: 'maxsize: 32 · timeout: 30s',
+    problem: 'Concurrent clients overwhelm the scheduler: connections drop or race.',
+    solution: 'FIFO RequestQueue with timeouts, cancellation and backpressure. Returns 503 when the queue is full and 504 when a request waits too long.',
+    metricAfter: 'queue: 16 × batch · timeout: 60 s',
     tag: 'scheduling',
   },
   {
     phase: 4,
     title: 'Prefill / Decode Separation',
     file: 'engine/scheduler.py',
-    problem: 'Large prompts (prefill) block all decode steps — Time-to-First-Token spikes for every queued request.',
-    solution: 'Independent budgets: ≤512 prefill tokens and ≤8 decode sequences per scheduler step. Chunked prefill splits long prompts across multiple iterations.',
-    metricLabel: 'Decode stall saved (402-token prompt)',
-    metricBefore: '415 ms (blocking)',
-    metricAfter: '307 ms (first chunk)',
+    problem: 'Long prompts stall every running decode, so time-to-first-token spikes for everyone.',
+    solution: 'A per-step prefill token budget plus chunked prefill: long prompts are split across steps so they cannot stall running decodes.',
+    metricLabel: 'Budget / chunk',
+    metricAfter: '2048 / 512 tok (CUDA) · 512 / 128 (MPS, CPU)',
     tag: 'scheduling',
   },
   {
     phase: 5,
-    title: 'KV Cache Memory Tracking',
-    file: 'engine/kv_cache_tracker.py',
-    problem: 'No visibility into how much GPU memory KV caches consume during execution.',
-    solution: 'KVCacheTracker monitors physical KV memory footprint per sequence. Feeds into block eviction decisions.',
+    title: 'KV Memory Tracking',
+    file: 'engine/kv_cache_config.py',
+    problem: 'No visibility into how much memory KV caches really need.',
+    solution: 'Bytes-per-token sizing from the model config (with the correct head_dim per family) and logical KV accounting per sequence.',
     tag: 'memory',
   },
   {
     phase: 6,
     title: 'Block Allocator',
     file: 'engine/block_allocator.py',
-    problem: 'Standard Transformers pre-allocate max_sequence_length tensors per request — up to 60-80% wasted GPU memory.',
-    solution: 'Thread-safe BlockAllocator maps each sequence\'s tokens into logical blocks of 16 slots. allocate() / write_token() / free() interface. Eliminates external fragmentation.',
-    metricAfter: 'block_size: 16 tokens · pool: 256 blocks',
+    problem: 'Reserving max_length of KV per sequence leaves most of it unused, so few sequences fit.',
+    solution: 'Fixed 16-token blocks and per-sequence block tables, with ref counts and content hashes so full blocks can be shared.',
+    metricAfter: 'block_size: 16 tokens · ref-counted',
     tag: 'memory',
   },
   {
     phase: 7,
     title: 'Paged KV Cache',
     file: 'engine/paged_kv_cache.py',
-    problem: 'Logical block IDs have no physical storage — KV tensors still live as contiguous per-sequence arrays.',
-    solution: 'PagedKVCacheManager maps logical block IDs to pre-allocated physical GPU tensor slots. write_kv() / read_kv() per token position. Enables eviction and swap.',
+    problem: 'Logical blocks need physical storage that every layer can address.',
+    solution: 'One pre-allocated device pool shaped [layers, blocks, 16, H, D]. On CUDA it is sized automatically by profiling free GPU memory.',
+    metricAfter: 'KV_NUM_BLOCKS=auto',
     tag: 'memory',
   },
   {
     phase: 8,
-    title: 'Batch Attention Integration',
+    title: 'Paged Attention Integration',
     file: 'engine/attention_wrapper.py',
-    problem: 'Each decode step rebuilds the full KV cache from the paged pool — expensive Metal dispatch overhead on MPS.',
-    solution: 'Keep HuggingFace past_key_values live on the sequence during decode (skip pool read). Write new token into pool each step for eviction accuracy.',
-    metricLabel: 'Decode step throughput',
-    metricBefore: '85.9 tok/s (pool-reconstruct)',
-    metricAfter: '99.6 tok/s (live KV)',
+    problem: 'In v2 each sequence kept its own HF cache and ran its own forward pass. The pool was only a shadow copy, so there was no real GPU batching.',
+    solution: 'A custom attention backend registered with HuggingFace writes new K/V into the pool and attends through block tables. Every step is one packed [1, T] forward pass mixing prefill chunks and decode tokens.',
+    metricLabel: 'Continuous batching vs HF sequential (M2 smoke)',
+    metricBefore: '27.3 tok/s',
+    metricAfter: '99.1 tok/s · 3.6×',
     tag: 'memory',
   },
   {
     phase: 9,
-    title: 'CPU Staging Pool & Swapping',
+    title: 'Preemption: Swap or Recompute',
     file: 'engine/cpu_swap_manager.py',
-    problem: 'GPU block exhaustion causes OOM crashes or silent request drops under burst load.',
-    solution: 'CPUSwapManager copies KV tensors of the largest preempted sequence to host RAM, freeing GPU blocks. Sequence resumes after blocks are available. 0 HTTP 500s.',
-    metricAfter: 'CPU pool: 128 blocks · 0 OOM crashes',
+    problem: 'When the pool is full, a running sequence can’t grow. Crashing or dropping requests is not acceptable.',
+    solution: 'FCFS admission, LIFO preemption: the most recently arrived sequence is preempted. If it is decoding it is swapped to pinned CPU memory, otherwise its blocks are dropped and it re-prefills later.',
+    metricAfter: 'PREEMPTION_MODE=swap → falls back to recompute',
     tag: 'memory',
   },
   {
     phase: 10,
-    title: 'Unified Metrics Aggregation',
+    title: 'Unified Metrics',
     file: 'engine/metrics_aggregator.py',
-    problem: 'No unified telemetry surface — throughput, latency, SLO, and cache stats are scattered across components.',
-    solution: 'MetricsAggregator consolidates: P50/P95/P99 TTFT, aggregate tok/s, queue depth, block utilization, swap counts, and SLO compliance into a single /metrics endpoint.',
-    metricAfter: 'P50 TTFT · P95 TTFT · P99 TTFT · SLO %',
+    problem: 'v2 metrics flattered the engine: TTFT excluded queueing, and "per-token latency" was forward time, not inter-token latency.',
+    solution: 'One /metrics surface: TTFT (including queueing), TPOT, real ITL, E2E p50–p99, prefix hit rate, speculation acceptance, step stats, KV utilisation and SLO compliance.',
+    metricAfter: 'TTFT · TPOT · ITL · E2E · p50–p99',
     tag: 'observability',
   },
   {
     phase: 11,
-    title: 'Load Testing Tool',
+    title: 'Load Testing',
     file: 'run_load_test.py',
-    problem: 'No way to characterize engine behavior under realistic traffic patterns.',
-    solution: 'CLI load tester with three profiles: constant (fixed RPS), ramp (linear ramp from start-rps to end-rps), burst (spike). Outputs JSON for cross-phase comparison.',
-    metricAfter: 'constant · ramp · burst profiles',
+    problem: 'Measuring after a client-side semaphore hides queueing (coordinated omission).',
+    solution: 'Open-loop Poisson or closed-loop load with a streaming client. Latency is measured from the scheduled send time, so a server that falls behind is charged for it.',
+    metricAfter: 'Poisson · closed-loop · seeded workloads',
     tag: 'testing',
   },
+  {
+    phase: 12,
+    title: 'Prefix Caching, Speculation, Streaming & GPU Benchmarks',
+    file: 'engine/spec_decode.py',
+    problem: 'Shared prompts were recomputed, decode stayed bandwidth-bound, and there was no streaming or standard API, or GPU numbers.',
+    solution: 'Hash-chained prefix caching; n-gram and draft-model speculative decoding (identical to greedy); SSE streaming and an OpenAI-compatible /v1/completions; an offline + serving benchmark suite, a Colab notebook and a GPU smoke test.',
+    metricLabel: 'M2 smoke',
+    metricAfter: 'prefix 2.0× · n-gram 2.9× (1 request)',
+    tag: 'testing',
+    isNew: true,
+  },
+];
+
+export const NEXT_STEPS = [
+  { title: 'Fused paged-attention kernel', desc: 'Triton or FlashInfer instead of gather + matmul, reading the pool in place.' },
+  { title: 'CUDA graphs for decode', desc: 'Remove Python and launch overhead at small batch sizes.' },
+  { title: 'Rejection sampling', desc: 'So speculative decoding also applies to sampled (non-greedy) requests.' },
+  { title: 'Tensor parallelism', desc: 'For models that don’t fit on one GPU.' },
 ];
