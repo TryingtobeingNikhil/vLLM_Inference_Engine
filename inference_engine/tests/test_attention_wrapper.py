@@ -1,171 +1,155 @@
 """
-tests/test_attention_wrapper.py — Phase 8 unit tests for attention_wrapper.py.
+tests/test_attention_wrapper.py — Phase 8: paged attention kernel.
 
-7 synchronous pytest tests — no async, no model loading.
-Uses torch on CPU only.
+The kernel is checked against a naive reference: for every sequence,
+concatenate its cached prefix K/V with this step's new K/V and run plain
+causal softmax attention (with explicit GQA head repetition).
 """
 
 from __future__ import annotations
 
+import math
+
 import pytest
 import torch
-from transformers import DynamicCache
 
 from inference_engine.engine.attention_wrapper import (
-    build_past_key_values,
-    extract_new_token_kv,
-    reconstruct_dynamic_cache,
-    reconstruct_past_key_values,
+    get_forward_context,
+    paged_attention_forward,
+    set_forward_context,
 )
 from inference_engine.engine.block_allocator import BlockAllocator
-from inference_engine.engine.kv_cache_config import KVCacheConfig
+from inference_engine.engine.kv_cache_config import compute_kv_cache_config
+from inference_engine.engine.model_runner import ModelRunner, SequenceInput
 from inference_engine.engine.paged_kv_cache import PagedKVCacheManager
+from inference_engine.tests.tiny_models import tiny_qwen2
 
+BLOCK_SIZE = 4
+NUM_HEADS, NUM_KV_HEADS, HEAD_DIM = 4, 2, 16
 
-# ── Minimal config stub ───────────────────────────────────────────────────────
 
 class _Cfg:
-    kv_block_size = 4
-    kv_num_blocks = 8
+    kv_block_size = BLOCK_SIZE
     device = "cpu"
 
 
-# ── Fixtures ──────────────────────────────────────────────────────────────────
-
-@pytest.fixture
-def kv_config() -> KVCacheConfig:
-    return KVCacheConfig(
-        num_layers=2,
-        num_kv_heads=4,
-        head_dim=16,
-        dtype=torch.float32,   # float32 for easier numerical comparison
-        device="cpu",
-    )
+class _Layer(torch.nn.Module):
+    layer_idx = 0
 
 
 @pytest.fixture
-def allocator() -> BlockAllocator:
-    return BlockAllocator(num_blocks=8, block_size=4)
+def setup():
+    model = tiny_qwen2()
+    allocator = BlockAllocator(64, BLOCK_SIZE)
+    pool = PagedKVCacheManager(compute_kv_cache_config(model, _Cfg), allocator, _Cfg)
+    return ModelRunner(model, pool), allocator, pool
 
 
-@pytest.fixture
-def manager(kv_config: KVCacheConfig, allocator: BlockAllocator) -> PagedKVCacheManager:
-    return PagedKVCacheManager(kv_config, allocator, _Cfg())
+# (start_pos, num_new_tokens): decode, spec-verify, tiny prompt,
+# long prefill from scratch, long chunk on top of a cached prefix.
+CASES = [(13, 1), (7, 5), (0, 3), (0, 20), (9, 18)]
 
 
-@pytest.fixture
-def populated_manager(manager: PagedKVCacheManager, allocator: BlockAllocator) -> PagedKVCacheManager:
-    """Allocate 1 block for seq1, write 3 tokens across 2 layers."""
-    allocator.allocate("seq1", 1)
-    bid = allocator.get_blocks("seq1")[0]
-    for token_pos in range(3):
-        for layer_idx in range(2):
-            key = torch.full(
-                (4, 16), float(token_pos + layer_idx), dtype=torch.float32
-            )
-            val = torch.full(
-                (4, 16), float(token_pos + layer_idx) * 2.0, dtype=torch.float32
-            )
-            manager.write_kv("seq1", layer_idx, token_pos, key, val)
-        # Update tokens_used after each token write
-        allocator._blocks[bid].tokens_used = token_pos + 1
-    return manager
+def _reference(q, k_ctx, v_ctx, start_pos, scale, sliding_window=None):
+    """q: [n, H, D]; k_ctx/v_ctx: [start_pos + n, H_kv, D] → [n, H, D]."""
+    group = NUM_HEADS // NUM_KV_HEADS
+    k = k_ctx.repeat_interleave(group, dim=1)              # [C, H, D]
+    v = v_ctx.repeat_interleave(group, dim=1)
+    scores = torch.einsum("qhd,chd->hqc", q, k) * scale
+    n, ctx = q.shape[0], k.shape[0]
+    q_pos = torch.arange(start_pos, start_pos + n).unsqueeze(1)
+    kv_pos = torch.arange(ctx).unsqueeze(0)
+    allowed = kv_pos <= q_pos
+    if sliding_window is not None:
+        allowed &= kv_pos > q_pos - sliding_window
+    scores = scores.masked_fill(~allowed, float("-inf"))
+    return torch.einsum("hqc,chd->qhd", scores.softmax(-1), v)
 
 
-# ── Tests ─────────────────────────────────────────────────────────────────────
+@pytest.mark.parametrize("sliding_window", [None, 6])
+def test_paged_attention_matches_reference(setup, sliding_window):
+    runner, allocator, pool = setup
+    torch.manual_seed(0)
+    k_cache, v_cache = pool.layer_caches(0)
 
-def test_reconstruct_past_key_values_shape(populated_manager: PagedKVCacheManager) -> None:
-    """reconstruct_past_key_values returns correct shape for each layer."""
-    result = reconstruct_past_key_values(
-        "seq1", populated_manager, num_layers=2, device="cpu"
-    )
-    assert len(result) == 2               # one per layer
-    assert result[0][0].shape == (1, 4, 3, 16)  # [batch, heads, tokens, head_dim]
-    assert result[0][1].shape == (1, 4, 3, 16)
-    assert result[1][0].shape == (1, 4, 3, 16)
+    inputs, prefixes = [], []
+    for i, (start, n) in enumerate(CASES):
+        allocator.allocate(f"s{i}", math.ceil((start + n) / BLOCK_SIZE))
+        table = allocator.get_blocks(f"s{i}")
+        # Pre-populate the cached prefix directly in the pool.
+        k_pre = torch.randn(start, NUM_KV_HEADS, HEAD_DIM, dtype=torch.float64)
+        v_pre = torch.randn(start, NUM_KV_HEADS, HEAD_DIM, dtype=torch.float64)
+        for p in range(start):
+            k_cache[table[p // BLOCK_SIZE], p % BLOCK_SIZE] = k_pre[p]
+            v_cache[table[p // BLOCK_SIZE], p % BLOCK_SIZE] = v_pre[p]
+        prefixes.append((k_pre, v_pre))
+        inputs.append(SequenceInput(f"s{i}", [1] * n, start, table, num_logits=1))
 
+    total = sum(n for _, n in CASES)
+    query = torch.randn(1, NUM_HEADS, total, HEAD_DIM, dtype=torch.float64)
+    key = torch.randn(1, NUM_KV_HEADS, total, HEAD_DIM, dtype=torch.float64)
+    value = torch.randn(1, NUM_KV_HEADS, total, HEAD_DIM, dtype=torch.float64)
+    scale = HEAD_DIM ** -0.5
 
-def test_reconstruct_values_correct(populated_manager: PagedKVCacheManager) -> None:
-    """Layer 0 token 0 key should be all 0.0 (token_pos=0 + layer_idx=0)."""
-    result = reconstruct_past_key_values(
-        "seq1", populated_manager, num_layers=2, device="cpu"
-    )
-    # Layer 0, token 0: value written was float(0 + 0) = 0.0
-    assert torch.allclose(
-        result[0][0][0, :, 0, :],     # [heads, head_dim]
-        torch.zeros(4, 16, dtype=torch.float32),
-    )
-    # Layer 1, token 1: value written was float(1 + 1) = 2.0
-    assert torch.allclose(
-        result[1][0][0, :, 1, :],
-        torch.full((4, 16), 2.0, dtype=torch.float32),
-    )
+    meta, *_ = runner.prepare(inputs)
+    with set_forward_context(meta):
+        out, weights = paged_attention_forward(
+            _Layer(), query, key, value, None, scaling=scale, sliding_window=sliding_window
+        )
+    assert weights is None
+    assert out.shape == (1, total, NUM_HEADS, HEAD_DIM)
 
-
-def test_reconstruct_dynamic_cache_type(populated_manager: PagedKVCacheManager) -> None:
-    """reconstruct_dynamic_cache returns a DynamicCache instance."""
-    result = reconstruct_dynamic_cache(
-        "seq1", populated_manager, num_layers=2, device="cpu"
-    )
-    assert isinstance(result, DynamicCache)
-
-
-def test_build_past_key_values_dynamic_true(populated_manager: PagedKVCacheManager) -> None:
-    """build_past_key_values(use_dynamic_cache=True) returns DynamicCache."""
-    result = build_past_key_values(
-        "seq1", populated_manager, 2, "cpu", use_dynamic_cache=True
-    )
-    assert isinstance(result, DynamicCache)
-
-
-def test_build_past_key_values_dynamic_false(populated_manager: PagedKVCacheManager) -> None:
-    """build_past_key_values(use_dynamic_cache=False) returns a tuple."""
-    result = build_past_key_values(
-        "seq1", populated_manager, 2, "cpu", use_dynamic_cache=False
-    )
-    assert isinstance(result, tuple)
-    assert len(result) == 2
+    offset = 0
+    for (start, n), (k_pre, v_pre) in zip(CASES, prefixes):
+        q = query[0, :, offset:offset + n].transpose(0, 1)
+        k_new = key[0, :, offset:offset + n].transpose(0, 1)
+        v_new = value[0, :, offset:offset + n].transpose(0, 1)
+        expected = _reference(
+            q, torch.cat([k_pre, k_new]), torch.cat([v_pre, v_new]), start, scale, sliding_window
+        )
+        torch.testing.assert_close(out[0, offset:offset + n], expected, rtol=1e-9, atol=1e-9)
+        offset += n
 
 
-def test_extract_new_token_kv_legacy_tuple() -> None:
-    """extract_new_token_kv handles the legacy tuple-of-tuples format."""
-    # Build fake legacy past_key_values:
-    # batch=1, heads=4, seq_len=5, head_dim=16
-    # Each position i has value float(i)
-    keys = (
-        torch.arange(5, dtype=torch.float32)
-        .view(1, 1, 5, 1)
-        .expand(1, 4, 5, 16)
-    )
-    fake_pkv = tuple(
-        (keys.clone(), keys.clone() * 2)
-        for _ in range(2)
-    )
+def test_new_kv_written_to_slots(setup):
+    runner, allocator, pool = setup
+    allocator.allocate("s", 2)
+    inp = SequenceInput("s", [1, 2, 3], start_pos=3, block_table=allocator.get_blocks("s"))
+    key = torch.randn(1, NUM_KV_HEADS, 3, HEAD_DIM, dtype=torch.float64)
+    value = torch.randn(1, NUM_KV_HEADS, 3, HEAD_DIM, dtype=torch.float64)
+    query = torch.randn(1, NUM_HEADS, 3, HEAD_DIM, dtype=torch.float64)
+    meta, *_ = runner.prepare([inp])
+    with set_forward_context(meta):
+        paged_attention_forward(_Layer(), query, key, value, None)
 
-    key_slice, val_slice = extract_new_token_kv(fake_pkv, layer_idx=0, token_position=4)
-
-    assert key_slice.shape == (4, 16)
-    # The last position in seq_len=5 is index 4 → value 4.0
-    assert torch.allclose(key_slice, torch.full((4, 16), 4.0))
-    assert torch.allclose(val_slice, torch.full((4, 16), 8.0))  # 4.0 * 2
+    table = allocator.get_blocks("s")
+    k_cache, _ = pool.layer_caches(0)
+    for j, pos in enumerate(range(3, 6)):
+        torch.testing.assert_close(k_cache[table[pos // 4], pos % 4], key[0, :, j])
 
 
-def test_extract_new_token_kv_dynamic_cache() -> None:
-    """extract_new_token_kv handles the DynamicCache format."""
-    # Build a DynamicCache with 2 layers, 3 tokens
-    # Each token position gets value float(token_pos)
-    cache = DynamicCache()
-    for layer_idx in range(2):
-        # shape: [1, num_kv_heads=4, seq_len=3, head_dim=16]
-        key_data = torch.zeros(1, 4, 3, 16, dtype=torch.float32)
-        for pos in range(3):
-            key_data[0, :, pos, :] = float(pos)
-        val_data = key_data.clone() * 2.0
-        cache.update(key_data, val_data, layer_idx)
+def test_forward_context_is_scoped(setup):
+    runner, allocator, _ = setup
+    allocator.allocate("s", 1)
+    meta, *_ = runner.prepare([SequenceInput("s", [1], 0, allocator.get_blocks("s"))])
+    assert get_forward_context() is None
+    with set_forward_context(meta):
+        assert get_forward_context() is meta
+    assert get_forward_context() is None
 
-    key_slice, val_slice = extract_new_token_kv(cache, layer_idx=0, token_position=2)
 
-    assert key_slice.shape == (4, 16)
-    # Last position in the 3-token sequence is index 2 → value 2.0
-    assert torch.allclose(key_slice, torch.full((4, 16), 2.0))
-    assert torch.allclose(val_slice, torch.full((4, 16), 4.0))  # 2.0 * 2
+def test_falls_back_to_sdpa_without_context():
+    """Outside an engine step the backend behaves like HF's SDPA, so the same
+    model object still works with model.generate()."""
+    from transformers.integrations.sdpa_attention import sdpa_attention_forward
+
+    torch.manual_seed(0)
+    module = _Layer()
+    module.num_key_value_groups = NUM_HEADS // NUM_KV_HEADS
+    module.is_causal = True
+    q = torch.randn(1, NUM_HEADS, 5, HEAD_DIM)
+    k = torch.randn(1, NUM_KV_HEADS, 5, HEAD_DIM)
+    v = torch.randn(1, NUM_KV_HEADS, 5, HEAD_DIM)
+    ours, _ = paged_attention_forward(module, q, k, v, None, scaling=0.25)
+    ref, _ = sdpa_attention_forward(module, q, k, v, None, scaling=0.25)
+    torch.testing.assert_close(ours, ref)

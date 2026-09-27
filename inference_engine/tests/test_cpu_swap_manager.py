@@ -63,9 +63,9 @@ def swap_manager(kv_config: KVCacheConfig) -> CPUSwapManager:
 
 
 def test_cpu_pool_allocated(swap_manager: CPUSwapManager) -> None:
-    """cpu_key_pool must have shape (num_cpu_blocks, block_size, num_layers, num_kv_heads, head_dim)."""
+    """cpu_key_pool mirrors the device layout: (num_layers, num_cpu_blocks, block_size, num_kv_heads, head_dim)."""
     # 8 blocks × 4 slots × 2 layers × 4 heads × 16 head_dim
-    assert swap_manager.cpu_key_pool.shape == (8, 4, 2, 4, 16), (
+    assert swap_manager.cpu_key_pool.shape == (2, 8, 4, 4, 16), (
         f"Unexpected cpu_key_pool shape: {swap_manager.cpu_key_pool.shape}"
     )
     assert swap_manager.cpu_key_pool.device.type == "cpu", (
@@ -130,12 +130,12 @@ def test_swap_out_preserves_data(
     swapped = swap_manager.swap_out("seq1", device_blocks, paged_manager, allocator)
 
     cpu_bid = swapped.cpu_block_ids[0]
-    # cpu_key_pool[cpu_bid, slot=0, layer=0] should equal key_data
+    # cpu_key_pool[layer=0, cpu_bid, slot=0] should equal key_data
     assert torch.allclose(
-        swap_manager.cpu_key_pool[cpu_bid, 0, 0], torch.ones(4, 16)
+        swap_manager.cpu_key_pool[0, cpu_bid, 0], torch.ones(4, 16)
     ), "Key data not preserved in CPU pool"
     assert torch.allclose(
-        swap_manager.cpu_value_pool[cpu_bid, 0, 0], torch.ones(4, 16) * 2.0
+        swap_manager.cpu_value_pool[0, cpu_bid, 0], torch.ones(4, 16) * 2.0
     ), "Value data not preserved in CPU pool"
 
 
@@ -211,13 +211,13 @@ def test_swap_in_restores_data(
     swap_manager.swap_in("seq1", paged_manager, allocator)
 
     new_block_id = allocator.get_blocks("seq1")[0]
-    # paged_manager.key_pool[new_block_id, slot=0, layer=0] should be all-7
+    # paged_manager.key_pool[layer=0, new_block_id, slot=0] should be all-7
     assert torch.allclose(
-        paged_manager.key_pool[new_block_id, 0, 0],
+        paged_manager.key_pool[0, new_block_id, 0],
         sentinel,
     ), "Key data not restored after swap-in"
     assert torch.allclose(
-        paged_manager.value_pool[new_block_id, 0, 0],
+        paged_manager.value_pool[0, new_block_id, 0],
         sentinel,
     ), "Value data not restored after swap-in"
 
@@ -272,3 +272,18 @@ def test_stats_structure(
     assert required_keys.issubset(s.keys()), (
         f"Missing keys in stats(): {required_keys - s.keys()}"
     )
+
+
+def test_discard_releases_cpu_blocks(
+    swap_manager: CPUSwapManager,
+    paged_manager: PagedKVCacheManager,
+    allocator: BlockAllocator,
+) -> None:
+    """discard() drops a swapped sequence (aborted request) and frees CPU blocks."""
+    allocator.allocate("seq1", 2)
+    free_before = swap_manager.num_free_blocks()
+    swap_manager.swap_out("seq1", allocator.get_blocks("seq1"), paged_manager, allocator)
+    assert swap_manager.num_free_blocks() == free_before - 2
+    assert swap_manager.discard("seq1") is True
+    assert swap_manager.num_free_blocks() == free_before
+    assert swap_manager.discard("seq1") is False

@@ -5,10 +5,13 @@ Pulls data from every existing tracker/manager (Phase 1–9) and computes
 derived system-wide metrics that none of the individual trackers provide on
 their own:
 
-  * End-to-end latency percentiles (p50/p95/p99) across all finished requests
+  * Latency percentiles (p50/p90/p95/p99) across finished requests: TTFT,
+    end-to-end latency, time-per-output-token (TPOT), inter-token latency
+    (ITL) and queue wait
   * System-wide token throughput and request throughput (rolling window)
   * SLO compliance fractions (TTFT and total latency)
-  * Cumulative OOM and swap-out counts
+  * Cumulative OOM, preemption, prefix-cache and speculative-decoding counters
+  * Per-step engine telemetry (batch size, tokens per step, KV utilisation)
 
 Design
 ------
@@ -37,6 +40,21 @@ if TYPE_CHECKING:
     from inference_engine.engine.request_queue import RequestQueue
     from inference_engine.engine.stage_tracker import StageTracker
     from inference_engine.metrics.collector import MetricsCollector
+
+
+def percentiles(values) -> dict:
+    """p50/p90/p95/p99/mean of *values* (all zeros when empty)."""
+    if len(values) == 0:
+        return {"p50": 0.0, "p90": 0.0, "p95": 0.0, "p99": 0.0, "mean": 0.0}
+    arr = np.asarray(values, dtype=float)
+    p50, p90, p95, p99 = np.percentile(arr, [50, 90, 95, 99])
+    return {
+        "p50": float(p50),
+        "p90": float(p90),
+        "p95": float(p95),
+        "p99": float(p99),
+        "mean": float(arr.mean()),
+    }
 
 
 # ── SystemSnapshot ────────────────────────────────────────────────────────────
@@ -126,13 +144,26 @@ class MetricsAggregator:
         self.request_queue = request_queue
         self.history_window_seconds = history_window_seconds
 
-        # Rolling windows: deque of (timestamp, value) tuples
-        # Unbounded length — entries are pruned by age on each read.
+        # Rolling windows: deque of (timestamp, value) tuples, pruned by age on
+        # every write *and* read so memory stays bounded even if nobody ever
+        # polls /metrics.
         self._throughput_window: deque[tuple[float, int]] = deque()
         self._request_completion_window: deque[tuple[float]] = deque()
+        # Throughput is averaged over min(window, uptime) — dividing by the
+        # full window during the first minute would under-report.
+        self._start_time: float = time.perf_counter()
 
         self._cumulative_finished: int = 0
         self._cumulative_oom: int = 0
+        self._cumulative_tokens: int = 0
+        self._finish_reasons: dict[str, int] = {}
+
+        # Per-step engine telemetry (bounded)
+        self._steps: deque[dict] = deque(maxlen=2000)
+        self._total_steps: int = 0
+        # Lifetime sums, so a client can difference two /metrics snapshots and
+        # get exact averages for just the interval between them.
+        self._step_sums: dict[str, float] = {}
 
         self._lock = threading.Lock()
 
@@ -146,6 +177,18 @@ class MetricsAggregator:
         """
         with self._lock:
             self._throughput_window.append((time.perf_counter(), count))
+            self._cumulative_tokens += count
+            self._prune_window(self._throughput_window)
+
+    def record_step(self, **fields) -> None:
+        """Record one scheduler step (batch composition, latency, KV usage)."""
+        fields["timestamp"] = time.perf_counter()
+        with self._lock:
+            self._steps.append(fields)
+            self._total_steps += 1
+            for key in ("num_seqs", "num_tokens", "num_prefill_tokens", "num_decode_seqs",
+                        "kv_utilization", "forward_ms"):
+                self._step_sums[key] = self._step_sums.get(key, 0.0) + fields.get(key, 0)
 
     def record_request_finished(self, finish_reason: str) -> None:
         """Record that a sequence has just transitioned to state='finished'.
@@ -158,7 +201,9 @@ class MetricsAggregator:
         """
         with self._lock:
             self._request_completion_window.append((time.perf_counter(),))
+            self._prune_window(self._request_completion_window)
             self._cumulative_finished += 1
+            self._finish_reasons[finish_reason] = self._finish_reasons.get(finish_reason, 0) + 1
             if finish_reason == "oom":
                 self._cumulative_oom += 1
 
@@ -179,6 +224,8 @@ class MetricsAggregator:
     def compute_throughput(self) -> tuple[float, float]:
         """Compute rolling-window token and request throughput.
 
+        The window length is ``min(history_window_seconds, uptime)``.
+
         Returns
         -------
         (tokens_per_sec, requests_per_sec)
@@ -191,43 +238,62 @@ class MetricsAggregator:
             if not self._throughput_window and not self._request_completion_window:
                 return (0.0, 0.0)
 
+            uptime = time.perf_counter() - self._start_time
+            window = max(1e-3, min(self.history_window_seconds, uptime))
             total_tokens = sum(count for _, count in self._throughput_window)
-            tokens_per_sec = total_tokens / self.history_window_seconds
-
-            requests_per_sec = (
-                len(self._request_completion_window) / self.history_window_seconds
-            )
+            tokens_per_sec = total_tokens / window
+            requests_per_sec = len(self._request_completion_window) / window
 
         return (tokens_per_sec, requests_per_sec)
 
     def compute_e2e_latency_percentiles(self) -> dict:
-        """Compute p50/p95/p99 for TTFT and total latency over all records.
+        """Compute latency percentiles over all retained request records.
 
         Returns
         -------
-        dict with keys "ttft_ms" and "total_latency_ms", each containing
-        {"p50": float, "p95": float, "p99": float}.
-        Returns zeroed values if no records exist.
+        dict with keys "ttft_ms", "total_latency_ms", "tpot_ms", "itl_ms",
+        "queue_wait_ms", each containing p50/p90/p95/p99/mean (zeros when no
+        data).  ITL pools every inter-token gap of every request.
         """
-        _zero = {"p50": 0.0, "p95": 0.0, "p99": 0.0}
-
         records = self.metrics_collector.get_all()
-        if not records:
-            return {"ttft_ms": dict(_zero), "total_latency_ms": dict(_zero)}
+        ttft = [r.ttft_ms for r in records]
+        total = [r.total_latency_ms for r in records]
+        tpot = [getattr(r, "tpot_ms", 0.0) for r in records
+                if getattr(r, "generated_tokens", 0) > 1]
+        queue = [getattr(r, "queue_wait_time_ms", 0.0) for r in records]
+        itl = [gap for r in records for gap in getattr(r, "per_token_latencies_ms", [])]
+        return {
+            "ttft_ms": percentiles(ttft),
+            "total_latency_ms": percentiles(total),
+            "tpot_ms": percentiles(tpot),
+            "itl_ms": percentiles(itl),
+            "queue_wait_ms": percentiles(queue),
+        }
 
-        ttft_arr = np.array([r.ttft_ms for r in records], dtype=float)
-        lat_arr = np.array([r.total_latency_ms for r in records], dtype=float)
+    def step_summary(self) -> dict:
+        """Aggregate the recent per-step telemetry."""
+        with self._lock:
+            steps = list(self._steps)
+            total_steps = self._total_steps
+            sums = dict(self._step_sums)
+        if not steps:
+            return {"total_steps": total_steps, "cumulative": sums}
 
-        def _pcts(arr: np.ndarray) -> dict:
-            return {
-                "p50": float(np.percentile(arr, 50)),
-                "p95": float(np.percentile(arr, 95)),
-                "p99": float(np.percentile(arr, 99)),
-            }
+        def mean(key: str) -> float:
+            values = [s.get(key, 0) for s in steps]
+            return float(np.mean(values)) if values else 0.0
 
         return {
-            "ttft_ms": _pcts(ttft_arr),
-            "total_latency_ms": _pcts(lat_arr),
+            "total_steps": total_steps,
+            "recent_steps": len(steps),
+            "avg_batch_size": mean("num_seqs"),
+            "avg_tokens_per_step": mean("num_tokens"),
+            "avg_prefill_tokens_per_step": mean("num_prefill_tokens"),
+            "avg_decode_seqs_per_step": mean("num_decode_seqs"),
+            "avg_kv_utilization": mean("kv_utilization"),
+            "step_latency_ms": percentiles([s.get("step_ms", 0.0) for s in steps]),
+            "forward_latency_ms": percentiles([s.get("forward_ms", 0.0) for s in steps]),
+            "cumulative": sums,
         }
 
     def compute_slo_compliance(
@@ -325,8 +391,14 @@ class MetricsAggregator:
             system, e2e_latency, slo_compliance, stage_breakdown,
             kv_cache, paged_kv_cache, cpu_swap, queue_stats
         """
+        with self._lock:
+            finish_reasons = dict(self._finish_reasons)
+            cumulative_tokens = self._cumulative_tokens
         return {
             "system": asdict(self.snapshot(requests_in_flight, requests_waiting)),
+            "tokens_generated_total": cumulative_tokens,
+            "finish_reasons": finish_reasons,
+            "engine_steps": self.step_summary(),
             "e2e_latency": self.compute_e2e_latency_percentiles(),
             "slo_compliance": self.compute_slo_compliance(),
             "stage_breakdown": self.stage_tracker.full_report(),

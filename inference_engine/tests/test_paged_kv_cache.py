@@ -52,8 +52,9 @@ def manager(kv_config: KVCacheConfig, allocator: BlockAllocator) -> PagedKVCache
 def test_pool_allocated(manager: PagedKVCacheManager) -> None:
     """Verify pool tensors have the expected shape and dtype."""
     # [num_blocks, block_size, num_layers, num_kv_heads, head_dim]
-    assert manager.key_pool.shape == (16, 8, 4, 4, 32)
-    assert manager.value_pool.shape == (16, 8, 4, 4, 32)
+    # [num_layers, num_blocks, block_size, num_kv_heads, head_dim]
+    assert manager.key_pool.shape == (4, 16, 8, 4, 32)
+    assert manager.value_pool.shape == (4, 16, 8, 4, 32)
     assert manager.key_pool.dtype == torch.float16
 
 
@@ -143,7 +144,7 @@ def test_clear_sequence_zeros_pool(
     )
 
     manager.clear_sequence("seq1")
-    assert float(manager.key_pool[bid].sum()) == pytest.approx(0.0)
+    assert float(manager.key_pool[:, bid].sum()) == pytest.approx(0.0)
 
 
 def test_copy_blocks_all_layers(
@@ -165,8 +166,8 @@ def test_copy_blocks_all_layers(
 
     manager.copy_blocks(src_id, dst_id, layer_idx=None)
 
-    assert torch.equal(manager.key_pool[dst_id], manager.key_pool[src_id])
-    assert torch.equal(manager.value_pool[dst_id], manager.value_pool[src_id])
+    assert torch.equal(manager.key_pool[:, dst_id], manager.key_pool[:, src_id])
+    assert torch.equal(manager.value_pool[:, dst_id], manager.value_pool[:, src_id])
 
 
 def test_copy_blocks_single_layer(
@@ -190,18 +191,18 @@ def test_copy_blocks_single_layer(
 
     # Layer 0 slot 0 of dst should now equal src
     assert torch.equal(
-        manager.key_pool[dst_id, :, 0],
-        manager.key_pool[src_id, :, 0],
+        manager.key_pool[0, dst_id],
+        manager.key_pool[0, src_id],
     )
     # Layer 1 of dst should remain all zeros
-    assert float(manager.key_pool[dst_id, :, 1].sum()) == pytest.approx(0.0)
+    assert float(manager.key_pool[1, dst_id].sum()) == pytest.approx(0.0)
 
 
 def test_stats_structure(
     manager: PagedKVCacheManager,
     allocator: BlockAllocator,
 ) -> None:
-    """stats() has all required keys; active_sequences reflects write cursors."""
+    """stats() has all required keys; active_sequences counts block owners."""
     allocator.allocate("seq1", 2)
     s = manager.stats()
 
@@ -210,5 +211,34 @@ def test_stats_structure(
     assert "block_allocator" in s
     assert "num_layers" in s
     assert "dtype" in s
-    # No write_kv called yet → _seq_write_cursors is empty
-    assert s["active_sequences"] == 0
+    assert s["active_sequences"] == 1
+    assert s["token_capacity"] == 16 * 8
+
+
+def test_write_slots_and_gather_roundtrip(
+    manager: PagedKVCacheManager,
+    allocator: BlockAllocator,
+) -> None:
+    """Hot-path scatter/gather agree with the slow per-token path."""
+    allocator.allocate("a", 2)
+    allocator.allocate("b", 1)
+    table_a = allocator.get_blocks("a")
+    table_b = allocator.get_blocks("b")
+    bs = manager.block_size
+    # a: positions 0..9 (spans two blocks), b: positions 0..2
+    slots = [table_a[p // bs] * bs + p % bs for p in range(10)]
+    slots += [table_b[0] * bs + p for p in range(3)]
+    keys = torch.randn(13, 4, 32).to(torch.float16)
+    values = torch.randn(13, 4, 32).to(torch.float16)
+    manager.write_slots(2, torch.tensor(slots), keys, values)
+
+    allocator.set_token_count("a", 10)
+    k_seq, v_seq = manager.read_kv_sequence("a", layer_idx=2)
+    assert torch.equal(k_seq, keys[:10])
+    assert torch.equal(v_seq, values[:10])
+
+    tables = torch.tensor([table_a, [table_b[0], 0]])
+    k_g, v_g = manager.gather(2, tables)
+    assert k_g.shape == (2, 2 * bs, 4, 32)
+    assert torch.equal(k_g[0, :10], keys[:10])
+    assert torch.equal(v_g[1, :3], values[10:])

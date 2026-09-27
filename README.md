@@ -4,335 +4,357 @@
 
 # 🧠 PageServe
 
-### *A high-performance LLM inference engine built from scratch featuring continuous batching, paged KV-cache, and CPU swapping.*
+### *An LLM inference engine built from scratch: continuous batching over a paged KV cache, prefix caching, preemption and speculative decoding — in readable PyTorch.*
 
 [![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=flat-square&logo=python&logoColor=white)](https://python.org)
-[![PyTorch](https://img.shields.io/badge/PyTorch-2.1+-EE4C2C?style=flat-square&logo=pytorch&logoColor=white)](https://pytorch.org)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.3+-EE4C2C?style=flat-square&logo=pytorch&logoColor=white)](https://pytorch.org)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.110+-009688?style=flat-square&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
-[![HuggingFace](https://img.shields.io/badge/%F0%9F%A4%97%20Transformers-4.40+-yellow?style=flat-square)](https://huggingface.co)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE)
+[![HuggingFace](https://img.shields.io/badge/%F0%9F%A4%97%20Transformers-4.51–5.x-yellow?style=flat-square)](https://huggingface.co)
+[![Colab](https://img.shields.io/badge/Colab-T4%20%7C%20L4%20%7C%20A100-F9AB00?style=flat-square&logo=googlecolab&logoColor=white)](colab/PageServe_Colab.ipynb)
 
-**From a naive single-request bottleneck to a production-grade scheduling engine. PageServe is an educational and modular showcase of how modern LLM serving architectures work under the hood.**
-
-[Quick Start](#-quick-start) · [Architecture](#-architecture) · [Development Phases](#-development-phases) · [Engineering Decisions](#-key-engineering-decisions) · [API Reference](#-api-reference) · [Validation & Benchmarks](#-validation--benchmarking)
+[Quick start](#-quick-start) · [Colab](#-run-it-on-a-colab-gpu) · [How it works](#-how-it-works) · [Benchmarks](#-benchmarking) · [API](#-api-reference) · [Configuration](#%EF%B8%8F-configuration)
 
 </div>
 
 ---
 
-## 🎯 The Problem
+## 🎯 The problem
 
-Naive LLM deployment uses a simple wrapper around HuggingFace's `generate()` method. This design has critical limitations:
-1. **Head-of-Line Blocking**: One client requesting 500 tokens blocks another client requesting 5 tokens for the entire duration of the generation.
-2. **Dynamic Memory Waste (KV-Cache Fragmentation)**: Standard Transformers allocate KV-caches as contiguous arrays in GPU memory. Because output lengths are unpredictable, this leads to significant internal fragmentation, reserving more space than needed and limiting concurrency.
-3. **Out-of-Memory (OOM) Vulnerability**: Under load, concurrent request allocation spikes GPU memory, crashing the server.
+Serving an LLM with a plain `model.generate()` wrapper wastes the GPU:
 
-**PageServe solves this.** By implementing an iteration-level scheduler with Paged KV-Cache allocation and CPU-side swapping, it maximizes GPU utilization and concurrency while gracefully handling memory pressure.
+1. **One request at a time.** Decoding one token for one sequence is memory-bandwidth bound: the GPU streams every weight to produce a single token and sits mostly idle. Serving 32 users costs almost 32× the time of one.
+2. **Static batching wastes work.** Padding requests into a batch forces everyone to wait for the longest prompt *and* the longest output.
+3. **Contiguous KV caches fragment memory.** Reserving `max_length` of KV per sequence leaves most of it unused, so few sequences fit.
 
----
+PageServe fixes these the way production engines (vLLM, SGLang, TGI) do — built step by step so every mechanism is visible.
 
 ## ✨ Features
 
-- **Continuous Batching**: Iteration-level scheduling allows new requests to be admitted during the decode steps of running requests.
-- **Paged KV-Cache**: Eliminates memory fragmentation by breaking down the key-value cache of active sequences into fixed-sized logical blocks (size 16) mapped to physical tensors.
-- **CPU-GPU Swap Pool**: Prevents OOM crashes under high load. Swaps idle or preempted sequences out to a CPU-side staging pool, freeing up device blocks for active generation.
-- **Independent Prefill/Decode Budgets**: Avoids overloading GPU execution by capping the number of prompt tokens prefilled per iteration and limiting max decode batch size.
-- **Unified Telemetry & Metrics**: Real-time rollups of throughput (tokens/sec), queue depth, latency percentiles ($P_{50}$ / $P_{95}$ / $P_{99}$), and SLO compliance rates.
-- **Multi-Profile Load Tester**: Simulates constant, ramp, and burst load patterns to benchmark engine behavior and compare different phases.
+- **Continuous batching** — every scheduler step packs *all* running work (prefill chunks of new prompts + one decode token per running sequence) into **one** forward pass. Requests join and leave the batch between steps.
+- **Paged KV cache that attention actually uses** — K/V live in fixed-size blocks in one pre-allocated pool; a custom attention backend plugged into HuggingFace models writes and reads the pool through per-sequence block tables. No per-sequence `past_key_values`.
+- **Chunked prefill** — long prompts are split across steps so they can't stall running decodes.
+- **Automatic prefix caching** — full blocks are content-hashed (radix-tree semantics); requests sharing a prompt prefix reuse its KV instead of recomputing it.
+- **Preemption** — when the pool is full, the newest request is **swapped** to CPU (pinned memory) or **dropped for recompute**, so the engine degrades gracefully instead of OOMing.
+- **Speculative decoding** — n-gram (prompt-lookup) or draft-model proposals, verified in one batched pass; output is identical to greedy decoding.
+- **Streaming API** — SSE on the native `/generate`, plus an **OpenAI-compatible** `/v1/completions`; client disconnects free KV memory.
+- **Honest measurement** — client-side TTFT / TPOT / ITL / E2E p50–p99, goodput, GPU utilisation & memory; open-loop Poisson or closed-loop load; reproducible seeded workloads.
+- **Runs anywhere PyTorch does** — CUDA (T4/L4/A100), Apple MPS, CPU. Tested against transformers 4.51 and 5.x.
 
 ---
 
-## 🏗️ Architecture
+## 🚀 Quick start
 
+```bash
+git clone https://github.com/TryingtobeingNikhil/vLLM_Inference_Engine.git
+cd vLLM_Inference_Engine
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
 ```
-                                 PAGESERVE SYSTEM
-                                 
-       Request ────► [ FastAPI Server (app_v2.py on :8001) ]
-                                      │
-                                      ▼
-                      [ RequestQueue (FIFO with timeout) ]
-                                      │
-                                      ▼
-                     [ ContinuousBatchingScheduler ] ◄─── (run_loop background task)
-                                      │
-                ┌─────────────────────┴─────────────────────┐
-                │                                           │
-                ▼ (Admit sequence)                          ▼ (Single-token step)
-     [ Prefill Stage ]                              [ Decode Stage ]
-      - Prefill Budget                               - Decode batch limit
-      - Allocate blocks                              - Update attention KV cache
-                │                                           │
-                └─────────────────────┬─────────────────────┘
-                                      │
-                                      ▼
-                    [ PagedKVCacheManager (Device Pool) ]
-                                    ▲   │
-                           swap_in  │   │  swap_out
-                           (retry)  │   ▼  (memory pressure)
-                     [ CPUSwapManager (CPU Staging Pool) ]
+
+Start the engine (port 8001) and stream a completion:
+
+```bash
+MODEL_NAME=Qwen/Qwen2.5-0.5B-Instruct python -m uvicorn inference_engine.server.app_v2:app --port 8001
+```
+
+```bash
+curl -N localhost:8001/generate -H 'content-type: application/json' \
+  -d '{"prompt": "Explain paged attention in one sentence.", "max_new_tokens": 64, "stream": true}'
+```
+
+The Phase 1 baseline (sequential HF `generate()`) runs the same way on port 8000:
+
+```bash
+python -m uvicorn inference_engine.server.app:app --port 8000
+```
+
+## ☁️ Run it on a Colab GPU
+
+Open **[`colab/PageServe_Colab.ipynb`](colab/PageServe_Colab.ipynb)** in Colab, pick a T4 / L4 / A100 runtime and *Run all*. It will:
+
+1. clone the repo and run [`scripts/colab_setup.sh`](scripts/colab_setup.sh) (keeps Colab's CUDA torch, installs the rest),
+2. run the unit tests and the **GPU smoke test** ([`scripts/gpu_smoke_test.py`](scripts/gpu_smoke_test.py)) — exact-match checks of every engine feature *on the GPU* plus a real-model sanity check,
+3. run the offline ablation and the serving benchmark with a model sized to the GPU,
+4. render charts and tables, and zip the results for download.
+
+Default models: T4 → `Qwen2.5-1.5B-Instruct` (fp16 — T4 has no bf16), L4 → `Qwen2.5-3B-Instruct`, A100 → `Qwen2.5-7B-Instruct` (bf16). The KV pool is sized automatically from free GPU memory.
+
+From a terminal instead of the notebook:
+
+```bash
+bash scripts/colab_setup.sh
+python scripts/gpu_smoke_test.py
+python -m benchmarks.bench_offline
+python -m benchmarks.bench_serving
+python -m benchmarks.plot_results results/*.json
 ```
 
 ---
 
-## 📁 Project Structure
+## 🏗️ How it works
+
+```
+ client ──► FastAPI (app_v2.py) ──► RequestQueue (FIFO, timeouts, backpressure)
+                                          │
+                  ┌───────────────────────▼─────────────────────────────┐
+                  │ ContinuousBatchingScheduler — one step:             │
+                  │  1. plan    decodes: 1 token each (+k speculative)  │
+                  │             prefills: next chunk, ≤ token budget    │
+                  │             admit new requests if blocks allow      │
+                  │             (prefix-cache hits shared, not redone)  │
+                  │             out of blocks? preempt newest: swap/    │
+                  │             recompute                               │
+                  │  2. execute ONE packed forward pass (worker thread) │
+                  │  3. apply   append/verify tokens, stream them,      │
+                  │             publish full blocks to prefix cache,    │
+                  │             finish + free                           │
+                  └──────┬───────────────────────────────▲──────────────┘
+                         │ SequenceInputs                │ sampled tokens
+                  ┌──────▼───────────────────────────────┴──────────────┐
+                  │ ModelRunner: pack tokens → [1, T], positions,       │
+                  │   slot mapping; HF model with the paged attention   │
+                  │   backend; logits only where sampled                │
+                  └──────┬──────────────────────────────────────────────┘
+                         │ write new K/V / gather context via block tables
+                  ┌──────▼─────────────────────┐  swap  ┌───────────────┐
+                  │ PagedKVCacheManager        │ ◄────► │ CPUSwapManager│
+                  │ [layers, blocks, 16, H, D] │        │ (pinned RAM)  │
+                  └──────▲─────────────────────┘        └───────────────┘
+                         │ block tables, ref counts, content hashes
+                  ┌──────┴─────────────────────┐
+                  │ BlockAllocator + prefix    │
+                  │ cache (LRU of freed blocks)│
+                  └────────────────────────────┘
+```
+
+### One number drives scheduling
+
+Each sequence tracks `num_computed_tokens` — how many of its tokens already have K/V in the pool. Every step it processes some *uncomputed* tokens: many for a prefill chunk, exactly one for a decode, all of them again after a recompute preemption. Whenever a step reaches the last token, its logits predict the next one. Prefill, chunked prefill, decode and recompute are the *same operation*, which is what lets one forward pass mix them. ([`sequence.py`](inference_engine/engine/sequence.py))
+
+### Packed batches and paged attention
+
+The runner concatenates every scheduled token into a single `[1, T]` batch with explicit `position_ids` — no padding flows through the MLPs. HuggingFace models dispatch attention through a registry, so PageServe registers its own backend ([`attention_wrapper.py`](inference_engine/engine/attention_wrapper.py)). Each layer hands it the new keys/values; it scatters them into the pool at each token's *slot* (`block_table[pos // 16] * 16 + pos % 16`) and attends each query to its sequence's context through the block table:
+
+* **short queries** (decode, speculative verification): all sequences batched — gather contexts, masked attention with two matmuls, GQA handled by grouping query heads;
+* **long queries** (prefill chunks): one fused `scaled_dot_product_attention` per sequence.
+
+It's a readable reference in plain PyTorch; production engines swap step 2 for a fused kernel (PagedAttention / FlashInfer) that reads the pool in place.
+
+### Prefix caching
+
+A full block's hash is `hash(parent_hash, its 16 tokens)`, so a hash names the whole prefix up to that block — a radix tree over blocks. New requests walk their prompt block by block and share every hit (ref-counted). Only full blocks are shared and sequences only write their private last block, so no copy-on-write is needed. Freed blocks keep their contents in an LRU pool until memory is needed. ([`block_allocator.py`](inference_engine/engine/block_allocator.py))
+
+### Preemption
+
+FCFS admission, LIFO preemption: when a running sequence can't grow, the most recently arrived one is preempted — swapped to a pinned CPU pool if it's decoding, else its blocks are dropped and it re-prefills later (usually cheap, since its blocks stay in the prefix cache). Nothing new is admitted while swapped sequences wait.
+
+### Speculative decoding
+
+Decode is bandwidth-bound: verifying 5 tokens costs about as much as generating 1. A proposer guesses k tokens; the target scores `[last, d1..dk]` in one pass; drafts are accepted while they match the target's greedy choice, plus one free "bonus" token. Output is identical to greedy decoding. ([`spec_decode.py`](inference_engine/engine/spec_decode.py))
+
+* `SPECULATIVE_METHOD=ngram` — prompt lookup: continue the most recent earlier occurrence of the last n tokens. Free; great for summarisation, RAG, code edits.
+* `SPECULATIVE_METHOD=draft` — a small same-family model (e.g. Qwen2.5-0.5B for Qwen2.5-7B) with its own paged pool sharing the target's block tables.
+
+Speculation pays off most when the GPU is latency-bound (small batches); at large batch sizes decode becomes compute-bound and verification work competes with other requests. It applies to greedy requests only.
+
+---
+
+## 📁 Project structure
 
 ```
 inference_engine/
-├── config.py               # Central config dataclass (all tunable parameters)
-├── models/
-│   └── loader.py           # Device-agnostic model and tokenizer loader (supports MPS/CUDA/CPU)
-├── metrics/
-│   └── collector.py        # Thread-safe raw metrics accumulator
-├── server/
-│   ├── app.py              # Phase 1: Sequential serving FastAPI app (:8000)
-│   └── app_v2.py           # Phase 2+: Continuous batching FastAPI app (:8001)
+├── config.py                 # All tunables; every field overridable by env var
+├── models/loader.py          # Direct-to-GPU loading, dtype auto (bf16/fp16/fp32), EOS ids
 ├── engine/
-│   ├── sequential.py       # Phase 1: Naive generation baseline
-│   ├── sequence.py         # Sequence tracking structure (states, tokens, time, blocks)
-│   ├── scheduler.py        # Continuous batching scheduling loop
-│   ├── request_queue.py    # FIFO request queue with request timeout constraints
-│   ├── stage_tracker.py    # Tracks whether sequences are in prefill or decode stages
-│   ├── kv_cache_config.py  # Calculates default memory limits and block sizing
-│   ├── kv_cache_tracker.py # Monitors current KV memory footprint
-│   ├── block_allocator.py  # Thread-safe logical block allocation manager
-│   ├── paged_kv_cache.py   # Physical GPU tensor block storage
-│   ├── cpu_swap_manager.py # Swapping mechanism between GPU and CPU staging pool
-│   ├── prefill_utils.py    # Multi-sequence prefill utilities
-│   ├── attention_wrapper.py# Paged attention layer wrapper logic
-│   └── metrics_aggregator.py# Phase 10: Unified telemetry & derived metrics rollup
-└── tests/                  # Pytest unit testing suite
-run_validation.py           # Validates sequential ordering baseline (Phase 1)
-run_validation_v2.py        # Benchmarks continuous batching speedup vs Phase 1
-run_load_test.py            # Generates synthetic load configurations and comparisons
-requirements.txt            # System dependencies
+│   ├── sequential.py         # Phase 1: naive prefill → decode loop (+ streaming)
+│   ├── sequence.py           # Per-request state, SamplingParams, latency metrics
+│   ├── request_queue.py      # FIFO queue: timeouts, cancellation, backpressure
+│   ├── scheduler.py          # Continuous batching: plan → execute → apply
+│   ├── model_runner.py       # Packed batched forward pass, KV pool auto-sizing
+│   ├── attention_wrapper.py  # Paged attention backend for HF models
+│   ├── sampler.py            # Greedy / temperature / top-k / top-p
+│   ├── spec_decode.py        # n-gram and draft-model proposers
+│   ├── block_allocator.py    # Block tables, ref counts, prefix cache
+│   ├── paged_kv_cache.py     # The device tensor pool
+│   ├── cpu_swap_manager.py   # Pinned CPU pool for swapping
+│   ├── kv_cache_config.py    # Bytes-per-token sizing from the model config
+│   ├── kv_cache_tracker.py   # Logical KV accounting
+│   ├── stage_tracker.py      # Per-step prefill/decode telemetry
+│   └── metrics_aggregator.py # /metrics: percentiles, throughput, SLOs, step stats
+├── server/
+│   ├── app.py                # Phase 1 server (:8000)
+│   ├── app_v2.py             # Engine server (:8001), SSE + OpenAI API
+│   └── detokenizer.py        # Incremental detokenization for streaming
+└── tests/                    # pytest suite (tiny offline models + real-model checks)
+load_test/                    # Workloads, arrival processes, streaming client, reports, GPU monitor
+benchmarks/
+├── bench_offline.py          # In-process ablation: batching / prefix / speculation
+├── bench_serving.py          # Launches servers, sweeps Poisson rates or concurrency
+├── plot_results.py           # Charts from result JSON
+└── legacy/                   # Original M2 micro-benchmarks
+scripts/                      # colab_setup.sh, gpu_smoke_test.py
+colab/PageServe_Colab.ipynb   # End-to-end Colab runbook
+run_load_test.py              # Load-test CLI
+run_validation*.py            # Original Phase 1 / Phase 2 validation scripts
 ```
 
----
+## 🛠️ Development phases
 
-## 🛠️ Development Phases
-
-PageServe was constructed incrementally through 11 modular phases to map the evolution of inference engine designs:
-
-* **Phase 1: Sequential Serving Baseline** - Single-request lock, synchronous token loop.
-* **Phase 2: Continuous Batching Scheduler** - Background execution task, iteration-level scheduling.
-* **Phase 3: Request Queue** - FIFO queueing to handle concurrent client requests gracefully without dropping connections.
-* **Phase 4: Prefill / Decode Separation** - Independent budgets for prompt tokens (prefill) and decode batches to prevent engine stalling.
-* **Phase 5: KV Cache Memory Tracking** - Monitors physical KV-cache footprint during execution.
-* **Phase 6: Block Allocator** - Dynamic block allocation mapping sequence tokens to logical blocks of size 16.
-* **Phase 7: Paged KV Cache** - Maps logical block indices to physical tensors stored on device.
-* **Phase 8: Batch Attention Integration** - Hooks up model forward passes to read/write paged attention segments.
-* **Phase 9: CPU Staging Pool & Swapping** - Swaps preempted sequence caches to host RAM when GPU memory limit is reached.
-* **Phase 10: Unified Metrics Aggregation** - End-to-end telemetry surface (P50/P95/P99 latency, throughput, SLO compliance).
-* **Phase 11: Load Testing Tool** - Simulates constant, ramp, and burst load patterns.
+1. **Sequential baseline** — single-request lock, synchronous token loop.
+2. **Continuous batching scheduler** — background loop, iteration-level scheduling.
+3. **Request queue** — FIFO with timeouts and backpressure.
+4. **Prefill / decode separation** — per-step prefill budget and chunked prefill.
+5. **KV memory tracking.**
+6. **Block allocator** — fixed 16-token blocks, block tables.
+7. **Paged KV cache** — one pre-allocated device pool.
+8. **Paged attention integration** — the model reads/writes the pool directly; one packed forward pass per step.
+9. **CPU swapping** — preemption without losing work.
+10. **Unified metrics.**
+11. **Load testing.**
+12. **Prefix caching, speculative decoding, streaming/OpenAI API, GPU benchmarks.**
 
 ---
 
-## 🔑 Key Engineering Decisions
+## 📊 Benchmarking
 
-### 1. Paged KV-Cache block allocation
-Instead of pre-allocating a static maximum sequence length tensor for every sequence, PageServe uses a logical `BlockAllocator` coupled with `PagedKVCacheManager` that manages memory in blocks of 16 tokens.
-- **Why**: Standard Transformers allocate memory for `max_sequence_length` up-front, resulting in up to 60-80% memory waste due to unused generation padding. Logical block mapping eliminates external fragmentation and permits high-density batching.
+All workloads are seeded; results record GPU, versions and git commit.
 
----
+### Offline ablation — what each optimisation buys
 
-### 2. CPU Staging Pool over Request Dropping
-When the GPU runs out of physical KV-cache blocks, PageServe does not reject incoming requests or crash. The `CPUSwapManager` copies the KV-cache of lower-priority (youngest) sequences to system RAM and clears their GPU blocks.
-- **Why**: Sustained burst traffic will eventually exhaust any GPU cache. Swapping allows the system to degrade gracefully by introducing latency (preemption) instead of throwing HTTP 500 errors or failing via GPU OOM.
-
----
-
-### 3. Separation of Prefill and Decode Budgets
-The scheduler processes a limited number of prefill tokens (`prefill_budget_tokens=512`) and active decodes (`decode_batch_limit=8`) per step.
-- **Why**: Prefill is compute-bound (takes longer to run initial prompt tokens), while decode is memory-bandwidth bound. Mixing too many large prompts in a single execution step causes spikes in iteration time, degrading the Time-to-First-Token (TTFT) for all queued requests.
-
----
-
-### 4. Graceful Error Handling Design
-
-| System Component | On Failure | Mitigation |
-| --- | --- | --- |
-| **Request Queue** | Queue Full | Rejects request with `429 Too Many Requests` or `QueueFullError` |
-| **Block Allocator** | GPU Block Exhaustion | Triggers preemption: swaps out oldest/youngest sequence to CPU memory |
-| **Swap Pool** | CPU Pool Exhaustion | Swapped sequences wait; new requests are blocked until active ones complete |
-| **HTTP client / Server** | Timeout | Clears sequence state on disconnect, releasing blocks |
-
----
-
-## 🚀 Quick Start
-
-### Prerequisites
-- Python 3.10+
-- PyTorch 2.1+ (with CUDA or Apple Silicon MPS support)
-- HuggingFace access token (optional, for gated models)
-
-### Installation
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/TryingtobeingNikhil/vLLM_Inference_Engine.git
-   cd vLLM_Inference_Engine
-   ```
-
-2. Create a virtual environment and install dependencies:
-   ```bash
-   python -m venv .venv
-   source .venv/bin/activate
-   pip install -r requirements.txt
-   ```
-
----
-
-### Running the Engines
-
-#### Running Phase 1 (Sequential Baseline Server)
 ```bash
-# Starts the Phase 1 server on port 8000
-python -m uvicorn inference_engine.server.app:app --host 0.0.0.0 --port 8000
+python -m benchmarks.bench_offline [--suites batching,prefix,spec] [--draft-model auto] [--quick]
 ```
 
-#### Running Phase 2+ (Continuous Batching Server)
+| Suite | Workload | Systems compared |
+|---|---|---|
+| `batching` | random prompts (256–512 tok), outputs 128–256 tok | HF sequential · HF static batching · engine with batch size 1 · continuous batching |
+| `prefix` | 1k-token shared system prompt + short questions | prefix caching off vs on |
+| `spec` | copy-heavy prompts, and random prompts | none · n-gram · draft model |
+
+Reports output tok/s, speedup, TTFT/TPOT/ITL percentiles, peak GPU memory, mean GPU utilisation, prefix-hit and acceptance rates.
+
+### Serving — latency under load
+
 ```bash
-# Starts the Phase 2 server on port 8001
-python -m uvicorn inference_engine.server.app_v2:app --host 0.0.0.0 --port 8001
+python -m benchmarks.bench_serving [--configs sequential,continuous,prefix,ngram] \
+    [--workload random|shared_prefix|repetitive] [--rates 2 4 8 16 inf | --concurrency 1 8 32 64]
 ```
 
-*Note: The model (`Qwen/Qwen2-0.5B` by default) will auto-download on the first launch. You can change this by setting the environment variable `export MODEL_NAME="your/choice"`.*
+Launches a server per configuration, sweeps Poisson request rates (open loop) or fixed concurrencies (closed loop) with a streaming client, and reports per level: throughput, TTFT / TPOT / ITL / E2E p50–p99, goodput (share of requests meeting TTFT ≤ 2 s and TPOT ≤ 100 ms), GPU utilisation and memory, plus engine stats from `/metrics`.
+
+### Ad-hoc load tests
+
+```bash
+python run_load_test.py --server phase2 --profile poisson --rps 8 --workload random \
+    --num-requests 200 --stream --ignore-eos
+python run_load_test.py --server phase2 --concurrency 32 --stream          # closed loop
+python run_load_test.py --server custom --url http://localhost:8000 --api openai \
+    --model Qwen/Qwen2.5-1.5B-Instruct --stream                             # e.g. vLLM
+```
+
+### How the numbers are measured
+
+- **TTFT** — scheduled send time → first streamed token (includes queueing).
+- **TPOT** — (last token − first token) / (tokens − 1), per request.
+- **ITL** — every gap between streamed chunks, pooled across requests.
+- **E2E** — scheduled send time → last token.
+- Latency is measured from the *scheduled* send time, so a server that falls behind is charged for it (no coordinated omission). Benchmarks use `ignore_eos` so every system generates the same number of tokens.
+- **GPU utilisation** is NVML's "time a kernel was running" — a busy-ness signal, not FLOP efficiency.
+
+A local smoke run (Apple M2, MPS, Qwen2-0.5B, 16 requests) already shows the shape of the results: continuous batching **3.6×** HF sequential throughput, prefix caching **2×** on the shared-prefix workload. Real GPU numbers come from the Colab notebook.
 
 ---
 
-## 📡 API Reference
+## 📡 API reference
 
-### POST `/generate`
-Submits a prompt for token generation. Blocks until generation is complete.
+### `POST /generate` (both servers)
 
-- **URL**: `http://localhost:8001/generate` (Phase 2) or `http://localhost:8000/generate` (Phase 1)
-- **Method**: `POST`
-- **Request Body**:
-  ```json
-  {
-    "prompt": "Write a short poem about latency.",
-    "max_new_tokens": 50
-  }
-  ```
-- **Response**:
-  ```json
-  {
-    "prompt": "Write a short poem about latency.",
-    "generated_text": "...",
-    "prompt_tokens": 8,
-    "generated_tokens": 50,
-    "ttft_ms": 110.2,
-    "total_latency_ms": 870.5,
-    "tokens_per_second": 57.4,
-    "per_token_latencies_ms": [15.5, 15.6, ...],
-    "gpu_memory_allocated_mb": 1150.4,
-    "gpu_memory_reserved_mb": 2048.0,
-    "timestamp": "2026-06-24T00:44:00Z"
-  }
-  ```
+```json
+{"prompt": "…", "max_new_tokens": 128, "temperature": 0.0, "top_p": 1.0, "top_k": -1,
+ "ignore_eos": false, "stream": false}
+```
 
----
+Non-streaming response: `generated_text`, `prompt_tokens`, `generated_tokens`, `ttft_ms`, `tpot_ms`, `total_latency_ms`, `per_token_latencies_ms` (ITL), `queue_wait_time_ms`, `cached_prompt_tokens`, `spec_draft_tokens`, `spec_accepted_tokens`, `finish_reason`, GPU memory.
 
-### GET `/metrics`
-Exposes system-wide telemetry computed by the `MetricsAggregator`.
+With `"stream": true`: Server-Sent Events `data: {"token_ids": […], "text": "…"}` per step, then one `{"done": true, …}` event with the full result, then `data: [DONE]`. (Phase 1 supports `max_new_tokens`, `ignore_eos` and `stream`.)
 
-- **URL**: `http://localhost:8001/metrics`
-- **Method**: `GET`
-- **Response**:
-  ```json
-  {
-    "system": {
-      "requests_in_flight": 3,
-      "requests_waiting": 0,
-      "requests_finished_total": 25,
-      "requests_oom_total": 0,
-      "requests_swapped_total": 2,
-      "throughput_tokens_per_sec": 124.5
-    },
-    "e2e_latency": {"ttft_ms": {"p50": 90.1, "p95": 115.0, "p99": 130.0}},
-    "slo_compliance": {"ttft_compliance_pct": 98.0, "sample_size": 25},
-    "stage_breakdown": {"prefill": {}, "decode": {}},
-    "kv_cache": {},
-    "paged_kv_cache": {},
-    "cpu_swap": {},
-    "queue_stats": {},
-    "scheduler": {"batch_size_over_time": [], "scheduler_step_latency_ms": []}
-  }
-  ```
+### `POST /v1/completions` (engine)
+
+OpenAI-style: `prompt`, `max_tokens`, `temperature`, `top_p`, `stream`, plus `ignore_eos`. Streams OpenAI chunks ending with a `usage` chunk.
+
+### `GET /metrics` (engine)
+
+`system` (in-flight, waiting, throughput), `e2e_latency` (TTFT/TPOT/ITL/E2E/queue p50–p99), `engine` (KV blocks, prefix hit rate, preemptions), `speculative_decoding` (acceptance, tokens per step), `engine_steps` (avg batch size, tokens/step, KV utilisation, step latency), `gpu_memory`, `paged_kv_cache`, `cpu_swap`, `queue_stats`, `slo_compliance`.
+
+### `GET /health`
+
+Model, device, batch occupancy, queue depth, KV block usage, enabled features.
 
 ---
 
 ## ⚙️ Configuration
 
-Tunable parameters located in [`inference_engine/config.py`](inference_engine/config.py) can be overridden using environment variables:
+Every field in [`config.py`](inference_engine/config.py) can be set via an upper-case environment variable (explicit constructor arguments win). The important ones:
 
-| Environment Variable | Default Value | Description |
-| --- | --- | --- |
-| `MODEL_NAME` | `"Qwen/Qwen2-0.5B"` | HuggingFace model identifier to load |
-| `DEVICE` | `Auto-detected` | Hardware device to use (`cuda`, `mps`, or `cpu`) |
-| `PORT` | `8000` | Port for the API server |
-| `METRICS_OUTPUT_PATH`| `"baseline_metrics.json"` | Path to write historical benchmark output |
-| `MAX_BATCH_SIZE` | `4` | Maximum number of concurrent sequences active in execution |
-| `PREFILL_BUDGET_TOKENS` | `512` | Max prompt tokens admitted for prefill per scheduler step |
-| `DECODE_BATCH_LIMIT` | `8` | Max active sequences allowed in decode batch |
-| `KV_BLOCK_SIZE` | `16` | Token capacity per cache block |
-| `KV_NUM_BLOCKS` | `256` | Number of physical GPU cache blocks |
-| `KV_NUM_CPU_BLOCKS` | `128` | Number of physical host memory cache blocks (swapping pool) |
+| Variable | Default | Meaning |
+|---|---|---|
+| `MODEL_NAME` | `Qwen/Qwen2-0.5B` | HF model id or local path (Llama/Qwen2/Qwen2.5/Qwen3/Mistral-style decoders) |
+| `DEVICE` | auto | `cuda`, `mps` or `cpu` |
+| `DTYPE` | `auto` | bf16 on Ampere+, fp16 on T4/MPS, fp32 on CPU |
+| `MAX_BATCH_SIZE` | 64 (CUDA) / 8 | max sequences in the running batch |
+| `PREFILL_BUDGET_TOKENS` | 2048 / 512 | prompt tokens processed per step (all sequences) |
+| `PREFILL_CHUNK_SIZE` | 512 / 128 | prompt tokens per sequence per step |
+| `MAX_MODEL_LEN` | min(model max, 4096) | longest prompt + output |
+| `KV_BLOCK_SIZE` | 16 | tokens per KV block |
+| `KV_NUM_BLOCKS` | auto | 0 = profile GPU memory (CUDA) / `KV_CACHE_MAX_MEMORY_MB` (else) |
+| `GPU_MEMORY_UTILIZATION` | 0.85 | share of GPU memory the engine may use |
+| `KV_CACHE_MAX_MEMORY_MB` | 1024 | KV pool size on CPU/MPS |
+| `ENABLE_PREFIX_CACHING` | 1 | share KV of common prompt prefixes |
+| `PREEMPTION_MODE` | `swap` | `swap` (falls back to recompute) or `recompute` |
+| `SWAP_SPACE_GB` | 2 | CPU swap pool size |
+| `SPECULATIVE_METHOD` | off | `ngram` or `draft` |
+| `NUM_SPECULATIVE_TOKENS` | 4 | drafts per step |
+| `DRAFT_MODEL_NAME` | – | draft model for `draft` |
+| `REQUEST_TIMEOUT_MS` | 60000 | max queue wait before 504 |
+| `MAX_QUEUE_SIZE` | 16 × batch | waiting requests before 503 |
 
 ---
 
-## 📊 Validation & Benchmarking
+## 🔬 Tests
 
-### 1. Sequential ordering validation
-Validates that the sequential baseline (Phase 1) processes requests in strict serialization.
 ```bash
-python run_validation.py
+pytest -m "not slow"     # ~20 s, offline: tiny random models, exact match vs HF generate()
+pytest                   # + real Qwen2-0.5B checks (downloads ~1 GB once)
 ```
 
----
-
-### 2. Continuous batching speedup benchmark
-Sends 8 concurrent requests to the Phase 2 server, measures performance, and compares it directly with the Phase 1 sequential baseline stored in `baseline_metrics.json`.
-```bash
-# Make sure Phase 2 server is running in another terminal
-python run_validation_v2.py
-```
-This generates comparison metrics and plots a `batch_size_over_time.png` graph tracking scheduler concurrency.
+The engine is checked token-for-token against HuggingFace `generate()` (float64 tiny models) under every combination that changes *how* tokens are computed: chunked prefill, batching, prefix caching, swap and recompute preemption, n-gram and draft speculation. Other suites cover the attention kernel against a naive reference (including sliding window and GQA), allocator ref-counting and hashing, sampling, streaming, aborts, timeouts, and both HTTP servers end to end.
 
 ---
 
-### 3. Load testing suite
-Executes load generation profiles against either server.
-```bash
-# Target Phase 2 server with a ramp load from 1 to 10 RPS over 30s
-python run_load_test.py --server phase2 --profile ramp --start-rps 1.0 --end-rps 10.0 --duration 30.0
+## 🧾 v3 audit — what was fixed
 
-# Compare Phase 1 and Phase 2 reports
-python run_load_test.py --server phase1 --output p1.json
-python run_load_test.py --server phase2 --output p2.json --compare-with p1.json
-```
+The v2 engine worked on small demos but did not do what its architecture claimed:
 
----
+- **The paged KV cache was not used for attention.** Each sequence kept its own HF `DynamicCache`, and the pool was a shadow copy written token-by-token with Python loops (≈20k tiny kernel launches for a 400-token prompt). Memory accounting was therefore fictional, and every sequence ran its own forward pass — no GPU batching. → The model now reads and writes the pool directly and each step is one packed forward pass.
+- **Swap race:** a sequence swapped out during a decode step could end up in both `running` and `swapped_out`, then be swapped back in as a duplicate.
+- **Preemption policy:** new arrivals evicted the *largest* running sequence, so old requests could be starved; now FCFS admission + LIFO preemption, with recompute fallback.
+- **Metrics:** TTFT excluded queueing; "per-token latency" was forward time, not inter-token latency; throughput always divided by 60 s (under-reporting after startup); the token window grew without bound unless `/metrics` was polled; Phase 1 TTFT ignored time waiting for the lock.
+- **Sizing & loading:** `head_dim` was derived as `hidden/heads` (wrong for several families); CUDA used `device_map="auto"` (silent CPU offload) and always fp16; multiple EOS ids (instruct models) were ignored.
+- **Load tester:** latency was measured after a client-side semaphore (coordinated omission) and TTFT was taken from the server.
+- **Found while testing on MPS:** non-blocking host→device copies of temporary buffers raced (garbage outputs); `index_copy_` on MPS copies the entire destination (1000× slower than `index_put_`).
 
-## 🔬 Run Unit Tests
-To verify all scheduler, block allocation, and swap logic functions correctly:
-```bash
-pytest inference_engine/tests/ -v
-```
+## 🗺️ Next steps
 
----
-
-## 🗺️ What I'd Do Differently
-
-- **Tensor-Level Batching**: Implement actual tensor batching using padded tensors or jagged attention operators (e.g., FlashAttention-2 or vLLM custom CUDA kernels) instead of thread-based sequence serialization.
-- **Disconnect-Aware Cancellation**: Propagate client disconnects into already-admitted sequences so expensive decode work can be stopped immediately.
-- **Speculative Decoding**: Integrate a smaller draft model to verify candidate tokens in parallel, improving decode step speeds.
-- **Dynamic Block Sizing**: Experiment with block sizes of 8 and 32 to study the impact of chunk overhead on compute performance and cache mapping.
+- A fused paged-attention kernel (Triton / FlashInfer) instead of gather + matmul.
+- CUDA graphs for decode steps (removes Python/launch overhead at small batch sizes).
+- Rejection sampling so speculation also applies to sampled requests.
+- Tensor parallelism for models that don't fit one GPU.
 
 ---
 
 <div align="center">
 
-**Built by [Nikhil Mourya](https://github.com/TryingtobeingNikhil)** · June 2026
+**Built by [Nikhil Mourya](https://github.com/TryingtobeingNikhil)**
 
 *PageServe is what LLM serving looks like when you build the engine block-by-block.*
 

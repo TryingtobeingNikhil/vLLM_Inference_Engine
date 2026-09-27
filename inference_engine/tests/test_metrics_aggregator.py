@@ -138,7 +138,8 @@ def test_compute_throughput_empty(aggregator: MetricsAggregator) -> None:
 
 
 def test_compute_throughput_nonzero(aggregator: MetricsAggregator) -> None:
-    """tokens_per_sec must equal total_tokens / history_window_seconds."""
+    """With a full window of uptime: tokens / history_window_seconds."""
+    aggregator._start_time = time.perf_counter() - 120.0   # up for 2 minutes
     # Record 10 tokens three times = 30 tokens total
     aggregator.record_token_generated(10)
     aggregator.record_token_generated(10)
@@ -150,6 +151,27 @@ def test_compute_throughput_nonzero(aggregator: MetricsAggregator) -> None:
     assert tokens_per_sec == pytest.approx(30.0 / 60.0, rel=1e-2), (
         f"Expected ~{30.0/60.0:.4f} tokens/sec, got {tokens_per_sec}"
     )
+
+
+def test_compute_throughput_uses_uptime_when_shorter(aggregator: MetricsAggregator) -> None:
+    """Shortly after startup the rate is averaged over uptime, not the full
+    60 s window (which would under-report by up to 60x)."""
+    aggregator._start_time = time.perf_counter() - 10.0    # up for 10 s
+    aggregator.record_token_generated(30)
+
+    tokens_per_sec, _ = aggregator.compute_throughput()
+
+    assert tokens_per_sec == pytest.approx(3.0, rel=0.05)
+
+
+def test_token_window_is_bounded_without_reads(aggregator: MetricsAggregator) -> None:
+    """Old entries are pruned on write, so memory stays bounded even if
+    compute_throughput() (i.e. /metrics) is never called."""
+    old = time.perf_counter() - 120.0
+    for _ in range(1000):
+        aggregator._throughput_window.append((old, 1))
+    aggregator.record_token_generated(1)
+    assert len(aggregator._throughput_window) == 1
 
 
 # ── Test 5: _prune_window removes old entries ──────────────────────────────────

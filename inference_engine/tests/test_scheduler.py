@@ -1,447 +1,379 @@
 """
-tests/test_scheduler.py — Unit tests for the Phase 2 continuous batching scheduler.
+tests/test_scheduler.py — Continuous batching scheduler, end to end.
 
-All tests use a session-scoped real model fixture (same pattern as Phase 1's
-test_sequential.py) — no mocking.  This properly validates the actual
-scheduler + model interaction.
+Most tests use a tiny float64 model so that the engine's greedy output can
+be compared token-for-token with HuggingFace ``generate()`` under every
+combination of features that changes *how* tokens are computed — chunked
+prefill, batching, prefix caching, swap / recompute preemption, n-gram and
+draft-model speculative decoding — without changing *what* is computed.
 
-Run with:
-    cd /Users/nikhilmourya/Desktop/PageServe
-    pytest inference_engine/tests/test_scheduler.py -v
+The ``slow`` tests at the bottom repeat the check with the real
+Qwen2-0.5B checkpoint (skipped when it cannot be loaded).
 
-Tests
------
-1. test_single_request_through_scheduler
-   Add one request, run the scheduler loop for N steps, verify state=="finished".
-
-2. test_multiple_requests_admitted
-   Add 3 requests to a scheduler with max_batch_size=4.
-   Verify all 3 reach "decoding" state within 5 scheduler steps.
-
-3. test_finished_sequences_removed
-   Verify a finished sequence is removed from scheduler.running.
-
-4. test_queue_wait_time_recorded
-   Verify queue_wait_time_ms > 0 for each finished sequence.
-
-5. test_batch_size_never_exceeds_max
-   Add 10 requests, run the scheduler, verify len(running) <= max_batch_size
-   at every recorded batch_size_over_time sample.
-
-Note on asyncio in pytest
---------------------------
-Each test that drives the scheduler loop uses asyncio.run() inside a standard
-(non-async) test function.  This avoids a pytest-asyncio dependency while
-still exercising the full async scheduler path.
+Each test drives the scheduler with ``asyncio.run`` from a normal test
+function (no pytest-asyncio needed).
 """
 
 from __future__ import annotations
 
 import asyncio
-import time
-from typing import List
+import random
 
 import pytest
+import torch
 
 from inference_engine.config import Config
 from inference_engine.engine.scheduler import ContinuousBatchingScheduler
-from inference_engine.engine.sequence import Sequence
-from inference_engine.models.loader import LoadedModel, load_model_and_tokenizer
+from inference_engine.engine.sequence import SamplingParams
+from inference_engine.tests.tiny_models import FakeTokenizer, hf_greedy, tiny_qwen2
 
-# ── Session-scoped model fixture (loaded once for the entire test run) ────────
-
-
-@pytest.fixture(scope="session")
-def cfg() -> Config:
-    """Config with a small batch size and short generations for fast tests."""
-    c = Config()
-    c.max_batch_size = 4
-    c.max_new_tokens = 10   # keeps test wall-clock short
-    return c
+# ── Fixtures / helpers ────────────────────────────────────────────────────────
 
 
-@pytest.fixture(scope="session")
-def loaded(cfg: Config) -> LoadedModel:
-    """Load model once; shared across all scheduler tests."""
-    return load_model_and_tokenizer(cfg)
+@pytest.fixture(scope="module")
+def model():
+    return tiny_qwen2(seed=0)
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+@pytest.fixture(scope="module")
+def workload(model):
+    """Mixed prompts: half share a 40-token prefix, plus two repetitive ones."""
+    rng = random.Random(1)
+    shared = [rng.randrange(97) for _ in range(40)]
+    prompts = []
+    for i in range(20):
+        base = shared if i % 2 == 0 else []
+        prompts.append(base + [rng.randrange(97) for _ in range(rng.randint(1, 30))])
+    prompts += [[1, 2, 3, 4, 5, 6, 7, 8] * 5] * 2
+    lengths = [rng.randint(1, 25) for _ in prompts]
+    refs = [hf_greedy(model, p, n) for p, n in zip(prompts, lengths)]
+    return prompts, lengths, refs
 
-SHORT_PROMPT = "The capital of France is"
 
-_N_STEPS_SINGLE = 30   # enough to finish a 10-token generation
-
-
-def _make_scheduler(loaded: LoadedModel, cfg: Config, max_batch_size: int = 4) -> ContinuousBatchingScheduler:
-    """Build a fresh scheduler for each test to avoid state leakage."""
-    c = Config()
-    c.max_batch_size = max_batch_size
-    c.scheduler_poll_interval_ms = 1.0
+def make_scheduler(model, draft=None, **overrides) -> ContinuousBatchingScheduler:
+    settings = dict(
+        device="cpu", kv_block_size=4, kv_num_blocks=512, max_batch_size=8,
+        prefill_budget_tokens=24, prefill_chunk_size=10, max_queue_size=64,
+    )
+    settings.update(overrides)
     return ContinuousBatchingScheduler(
-        model=loaded.model,
-        tokenizer=loaded.tokenizer,
-        config=c,
+        model, FakeTokenizer(), Config(**settings), draft_model=draft, eos_token_ids=[]
     )
 
 
-async def _run_scheduler_steps(
-    scheduler: ContinuousBatchingScheduler, n_steps: int
-) -> None:
-    """Drive the scheduler for *n_steps* iterations without starting run_loop()."""
-    for _ in range(n_steps):
-        if not scheduler.running and len(scheduler.request_queue) == 0:
-            await asyncio.sleep(0.001)
-            continue
-        await scheduler._schedule()
+async def run_all(scheduler, prompts, lengths, **sampling):
+    scheduler.start()
+    try:
+        requests = [
+            await scheduler.add_request(
+                "", prompt_token_ids=p, sampling=SamplingParams(max_new_tokens=n, **sampling)
+            )
+            for p, n in zip(prompts, lengths)
+        ]
+        return await asyncio.gather(*[future for _, future in requests])
+    finally:
+        await scheduler.stop()
 
 
-# ── Test 1: single request completes ─────────────────────────────────────────
+def assert_clean(scheduler):
+    """Every request finished and every resource was returned."""
+    stats = scheduler.block_allocator.stats(include_per_sequence=False)
+    assert stats["free_blocks"] == stats["num_blocks"], "leaked KV blocks"
+    assert stats["active_sequences"] == 0
+    assert not scheduler.running and not scheduler.swapped_out and not scheduler.preempted
+    assert scheduler.kv_tracker.stats()["active_sequences"] == 0
+    assert scheduler.cpu_swap_manager.stats()["swapped_sequences"] == 0
+    assert not scheduler._futures
 
 
-def test_single_request_through_scheduler(loaded: LoadedModel, cfg: Config):
-    """A single enqueued request must reach state='finished' within N steps."""
+# ── Correctness under every feature combination ───────────────────────────────
 
-    async def _run():
-        scheduler = _make_scheduler(loaded, cfg)
-        seq, _ = await scheduler.add_request(SHORT_PROMPT, max_new_tokens=5)
-        assert seq.state == "waiting"
-
-        await _run_scheduler_steps(scheduler, _N_STEPS_SINGLE)
-
-        assert seq.is_finished(), (
-            f"Expected state='finished', got '{seq.state}' after {_N_STEPS_SINGLE} steps"
-        )
-        assert seq.finish_reason in ("eos", "length"), (
-            f"finish_reason must be 'eos' or 'length', got '{seq.finish_reason}'"
-        )
-        assert len(seq.generated_token_ids) > 0, "Must have generated at least one token"
-        assert seq.ttft_ms > 0.0, "ttft_ms must be positive"
-
-    asyncio.run(_run())
+CONFIGS = {
+    "baseline": dict(enable_prefix_caching=False),
+    "prefix_cache": dict(enable_prefix_caching=True),
+    "tight_pool_swap": dict(kv_num_blocks=40, preemption_mode="swap", enable_prefix_caching=False),
+    "tight_pool_recompute": dict(kv_num_blocks=40, preemption_mode="recompute"),
+    "tight_pool_small_cpu": dict(kv_num_blocks=40, preemption_mode="swap", kv_num_cpu_blocks=12),
+    "ngram_spec": dict(speculative_method="ngram", num_speculative_tokens=4),
+    "ngram_spec_tight": dict(kv_num_blocks=40, speculative_method="ngram"),
+    "one_seq_at_a_time": dict(max_batch_size=1),
+}
 
 
-def test_single_token_request_finishes_after_prefill(loaded: LoadedModel, cfg: Config):
-    """The first token sampled by prefill must count toward max_new_tokens."""
-
-    async def _run():
-        scheduler = _make_scheduler(loaded, cfg)
-        seq, _ = await scheduler.add_request(SHORT_PROMPT, max_new_tokens=1)
-
-        await scheduler._schedule()
-
-        assert seq.is_finished()
-        assert seq.finish_reason in ("eos", "length")
-        assert len(seq.generated_token_ids) == 1
-
-    asyncio.run(_run())
-
-
-# ── Test 2: multiple requests all reach decoding state ───────────────────────
+@pytest.mark.parametrize("name", list(CONFIGS))
+def test_outputs_match_hf_generate(model, workload, name):
+    prompts, lengths, refs = workload
+    scheduler = make_scheduler(model, **CONFIGS[name])
+    results = asyncio.run(run_all(scheduler, prompts, lengths))
+    for seq, ref in zip(results, refs):
+        assert seq.generated_token_ids == ref
+        assert seq.finish_reason == "length"
+    assert_clean(scheduler)
+    if name.startswith("tight"):
+        assert scheduler.num_preemptions_swap + scheduler.num_preemptions_recompute > 0
+    if name == "prefix_cache":
+        assert scheduler.block_allocator.prefix_cache_hit_rate() > 0.2
+    if name == "ngram_spec":
+        assert scheduler.spec_decode_stats()["accepted_tokens"] > 0
 
 
-def test_multiple_requests_admitted(loaded: LoadedModel, cfg: Config):
-    """Three requests with max_batch_size=4 must all reach 'decoding' within 5 steps."""
+@pytest.mark.parametrize("draft_kind", ["same_model", "different_model"])
+def test_draft_model_speculation_matches_hf(model, workload, draft_kind):
+    prompts, lengths, refs = workload
+    draft = model if draft_kind == "same_model" else tiny_qwen2(seed=5, layers=1)
+    scheduler = make_scheduler(
+        model, draft=draft, speculative_method="draft", draft_model_name="tiny",
+        num_speculative_tokens=3,
+    )
+    results = asyncio.run(run_all(scheduler, prompts, lengths))
+    assert [s.generated_token_ids for s in results] == refs
+    stats = scheduler.spec_decode_stats()
+    if draft_kind == "same_model":
+        assert stats["acceptance_rate"] == pytest.approx(1.0)
+        assert stats["mean_tokens_per_step"] > 2.0
+    assert_clean(scheduler)
 
-    async def _run():
-        scheduler = _make_scheduler(loaded, cfg, max_batch_size=4)
 
-        seqs: List[Sequence] = []
+# ── Scheduling limits ─────────────────────────────────────────────────────────
+
+
+def test_batch_size_and_prefill_budget_respected(model, workload):
+    prompts, lengths, _ = workload
+    scheduler = make_scheduler(model, max_batch_size=3, prefill_budget_tokens=16)
+    observed = []
+    original = scheduler._plan_step
+
+    async def spy():
+        plan = await original()
+        prefill = sum(i.num_tokens for i in plan.items if not i.is_decode)
+        observed.append((len(scheduler.running), len(plan.items), prefill))
+        return plan
+
+    scheduler._plan_step = spy
+    asyncio.run(run_all(scheduler, prompts, lengths))
+    assert max(running for running, _, _ in observed) <= 3
+    assert max(items for _, items, _ in observed) <= 3
+    assert max(prefill for _, _, prefill in observed) <= 16
+
+
+def test_decode_and_prefill_share_one_forward_pass(model):
+    """While one request decodes, a newly arrived prompt is prefilled in the
+    same step (the whole point of continuous batching)."""
+
+    async def scenario():
+        scheduler = make_scheduler(model)
+        a, _ = await scheduler.add_request("", prompt_token_ids=[1, 2, 3],
+                                           sampling=SamplingParams(max_new_tokens=20))
         for _ in range(3):
-            seq, _ = await scheduler.add_request(SHORT_PROMPT, max_new_tokens=5)
-            seqs.append(seq)
-
-        # Run up to 5 scheduler steps.  All three should transition from
-        # "waiting" → "prefill" → "decoding" within this window.
-        for _ in range(5):
             await scheduler._schedule()
+        assert a.state == "decoding"
+        b, _ = await scheduler.add_request("", prompt_token_ids=list(range(30)),
+                                           sampling=SamplingParams(max_new_tokens=5))
+        plan = await scheduler._plan_step()
+        kinds = {item.seq.seq_id: item.is_decode for item in plan.items}
+        assert kinds == {a.seq_id: True, b.seq_id: False}
+        await scheduler.stop()
 
-        for i, seq in enumerate(seqs):
-            assert seq.state in ("decoding", "finished"), (
-                f"Sequence {i} in unexpected state '{seq.state}' after 5 steps. "
-                "Expected 'decoding' or 'finished'."
-            )
+    asyncio.run(scenario())
 
-    asyncio.run(_run())
 
+def test_prompt_longer_than_max_model_len_rejected(model):
+    async def scenario():
+        scheduler = make_scheduler(model, max_model_len=32)
+        with pytest.raises(ValueError, match="max_model_len"):
+            await scheduler.add_request("", prompt_token_ids=list(range(40)))
+        await scheduler.stop()
 
-# ── Test 3: finished sequences removed from running list ─────────────────────
+    asyncio.run(scenario())
 
 
-def test_finished_sequences_removed(loaded: LoadedModel, cfg: Config):
-    """After a sequence finishes, it must not remain in scheduler.running."""
+def test_generation_capped_at_max_model_len(model):
+    scheduler = make_scheduler(model, max_model_len=24)
+    (seq,) = asyncio.run(run_all(scheduler, [list(range(20))], [50]))
+    assert seq.num_tokens() == 24
+    assert seq.finish_reason == "length"
 
-    async def _run():
-        scheduler = _make_scheduler(loaded, cfg)
-        seq, _ = await scheduler.add_request(SHORT_PROMPT, max_new_tokens=3)
 
-        await _run_scheduler_steps(scheduler, _N_STEPS_SINGLE)
+# ── Stop conditions ───────────────────────────────────────────────────────────
 
-        assert seq.is_finished(), "Sequence should be finished by now"
-        assert seq not in scheduler.running, (
-            "Finished sequence must be removed from scheduler.running"
-        )
-        assert seq in scheduler.finished, (
-            "Finished sequence must be present in scheduler.finished"
-        )
 
-    asyncio.run(_run())
+def test_eos_stops_unless_ignored(model):
+    prompt = [3, 1, 4, 1, 5]
+    ref = hf_greedy(model, prompt, 12)
+    eos = ref[4]
+    first_eos = ref.index(eos)
 
-
-# ── Test 4: queue_wait_time_ms is recorded ────────────────────────────────────
-
-
-def test_queue_wait_time_recorded(loaded: LoadedModel, cfg: Config):
-    """Every finished sequence must have queue_wait_time_ms > 0."""
-
-    async def _run():
-        scheduler = _make_scheduler(loaded, cfg)
-
-        seqs: List[Sequence] = []
-        for _ in range(2):
-            seq, _ = await scheduler.add_request(SHORT_PROMPT, max_new_tokens=4)
-            seqs.append(seq)
-
-        # Introduce a small delay so queue wait is measurable
-        await asyncio.sleep(0.005)
-
-        await _run_scheduler_steps(scheduler, _N_STEPS_SINGLE)
-
-        for i, seq in enumerate(seqs):
-            assert seq.is_finished(), f"Sequence {i} not finished"
-            assert seq.queue_wait_time_ms > 0.0, (
-                f"Sequence {i}: queue_wait_time_ms must be > 0, "
-                f"got {seq.queue_wait_time_ms}"
-            )
-
-    asyncio.run(_run())
-
-
-# ── Test 5: running count never exceeds max_batch_size ───────────────────────
-
-
-def test_batch_size_never_exceeds_max(loaded: LoadedModel, cfg: Config):
-    """With 10 requests and max_batch_size=4, len(running) must never exceed 4."""
-    MAX_BS = 4
-
-    async def _run():
-        scheduler = _make_scheduler(loaded, cfg, max_batch_size=MAX_BS)
-
-        # Enqueue 10 requests
-        for _ in range(10):
-            await scheduler.add_request(SHORT_PROMPT, max_new_tokens=5)
-
-        # Drive the scheduler until queue is empty and all finish
-        max_observed_batch = 0
-        deadline = time.perf_counter() + 300.0  # 5-minute safety timeout
-        while time.perf_counter() < deadline:
-            if len(scheduler.request_queue) == 0 and not scheduler.running:
-                break
-            await scheduler._schedule()
-            max_observed_batch = max(max_observed_batch, len(scheduler.running))
-
-        # Verify batch size constraint from recorded telemetry
-        for ts, bs in scheduler.batch_size_over_time:
-            assert bs <= MAX_BS, (
-                f"batch_size_over_time entry ({ts:.3f}, {bs}) exceeds "
-                f"max_batch_size={MAX_BS}"
-            )
-
-        # Also verify the max observed directly
-        assert max_observed_batch <= MAX_BS, (
-            f"max observed running batch size {max_observed_batch} exceeds {MAX_BS}"
-        )
-
-        # All 10 should eventually finish
-        assert len(scheduler.finished) == 10, (
-            f"Expected 10 finished sequences, got {len(scheduler.finished)}"
-        )
-
-    asyncio.run(_run())
-
-
-# ── Test 6: prefill chunk budget defers processing of over-budget prompts ────
-
-
-def test_prefill_budget_respected(loaded: LoadedModel, cfg: Config):
-    """With chunked prefill, sequences are always admitted to self.running, but
-    the Stage-2 chunk-processing loop respects prefill_budget_tokens.
-
-    A 20-token prompt with chunk_size=128 means the chunk is 20 tokens.
-    With budget=10 (< 20), the admitted chunk size is capped at 10 so the
-    request makes progress without exceeding the per-step budget.
-    """
-    async def _run():
-        scheduler = _make_scheduler(loaded, cfg)
-        scheduler.prefill_budget_tokens = 10   # tighter than chunk size
-        seq = Sequence.create(
-            prompt="oversized prompt",
-            prompt_token_ids=list(range(20)),
-            max_new_tokens=5,
-        )
-        await scheduler.request_queue.enqueue(seq)
-
-        await scheduler._schedule()
-
-        # Sequence is admitted to running (new behaviour)
-        assert seq in scheduler.running
-        # One budget-sized chunk ran and the remainder is deferred.
-        assert seq.prefill_offset == 10
-        assert seq.state == "chunked_prefilling"
-
-    asyncio.run(_run())
-
-
-# ── Test 7: decode capacity prevents further admission ──────────────────────
-
-
-def test_decode_batch_limit_respected(loaded: LoadedModel, cfg: Config):
-    async def _run():
-        scheduler = _make_scheduler(loaded, cfg)
-        scheduler.decode_batch_limit = 2
-
-        first, _ = await scheduler.add_request(SHORT_PROMPT, max_new_tokens=5)
-        second, _ = await scheduler.add_request(SHORT_PROMPT, max_new_tokens=5)
-        await scheduler._schedule()
-        assert len(scheduler.running) == 2
-
-        waiting, _ = await scheduler.add_request(SHORT_PROMPT, max_new_tokens=5)
-        await scheduler._schedule()
-
-        assert len(scheduler.running) <= 2
-        assert waiting not in scheduler.running
-        assert scheduler.request_queue._queue[0].sequence is waiting
-
-    asyncio.run(_run())
-
-
-# ── Test 8: pool is source of truth — past_key_values stays None ─────────────
-
-
-def test_decode_uses_pool_not_past_key_values(loaded: LoadedModel, cfg: Config):
-    """After the Phase 8 optimization, seq.past_key_values is kept during decode
-    for performance, but must be set to None once finished.
-
-    Verifies:
-    - While decoding, seq.past_key_values is a valid cache object.
-    - Once the sequence finishes, seq.past_key_values is freed (set to None).
-    """
-
-    async def _run():
-        scheduler = _make_scheduler(loaded, cfg)
-        seq, _ = await scheduler.add_request(SHORT_PROMPT, max_new_tokens=5)
-
-        # Run scheduler steps until the sequence starts decoding
-        for _ in range(10):
-            await scheduler._schedule()
-            if seq.state in ("decoding", "finished"):
-                break
-
-        # During decoding: past_key_values should be preserved on seq for performance
-        if seq.state == "decoding":
-            assert seq.past_key_values is not None, (
-                "Expected past_key_values to be retained during decoding for performance"
-            )
-            assert len(seq.generated_token_ids) >= 1, "Must have at least the first token"
-
-        # Run until finished
-        for _ in range(10):
-            await scheduler._schedule()
-            if seq.state == "finished":
-                break
-
-        assert seq.state == "finished", "Sequence should have completed"
-        assert seq.past_key_values is None, (
-            "Expected past_key_values to be set to None upon completion to free memory"
-        )
-
-    asyncio.run(_run())
-
-
-
-# ── Test 9: KV pool written during decode (pool stays source of truth) ─────────────
-
-
-def test_kv_pool_written_during_decode(loaded: LoadedModel, cfg: Config):
-    """Phase 8: each decode step must update the paged pool for the sequence."""
-
-    async def _run():
-        scheduler = _make_scheduler(loaded, cfg)
-        seq, _ = await scheduler.add_request(SHORT_PROMPT, max_new_tokens=3)
-
-        # Run until decoding starts
-        for _ in range(10):
-            await scheduler._schedule()
-            if seq.state in ("decoding", "finished"):
-                break
-
-        if seq.state == "decoding":
-            tokens_before = len(seq.generated_token_ids)
-            await scheduler._schedule()
-            tokens_after = len(seq.generated_token_ids)
-            assert tokens_after >= tokens_before, "Decode step must generate tokens"
-
-    asyncio.run(_run())
-
-
-# ── Test 10: swap-out triggered instead of OOM kill ────────────────────────────
-
-
-def test_swap_out_triggers_on_oom(loaded: LoadedModel, cfg: Config):
-    """With a tiny block pool, memory pressure must trigger a swap instead of OOM kill.
-
-    Creates a scheduler with kv_num_blocks=2 and kv_num_cpu_blocks=8 so the
-    device pool is exhausted after one prefill.  A second request arriving under
-    memory pressure should cause the running sequence to be swapped to CPU rather
-    than the incoming request being killed with OOM.
-
-    Assertion: at least one sequence reaches state=='swapped' OR the swapped
-    sequence is successfully restored (state=='decoding'/'finished') rather
-    than both sequences ending with finish_reason=='oom'.
-    """
-
-    async def _run():
-        c = Config()
-        c.max_batch_size = 4
-        c.scheduler_poll_interval_ms = 1.0
-        c.kv_num_blocks = 2        # tiny pool — fills up after ~1 sequence
-        c.kv_num_cpu_blocks = 8    # enough CPU staging room
-        c.kv_block_size = 16
-
+    async def generate(ignore_eos):
         scheduler = ContinuousBatchingScheduler(
-            model=loaded.model,
-            tokenizer=loaded.tokenizer,
-            config=c,
+            model, FakeTokenizer(),
+            Config(device="cpu", kv_block_size=4, kv_num_blocks=64),
+            eos_token_ids=[eos],
         )
+        (seq,) = await run_all(scheduler, [prompt], [12], ignore_eos=ignore_eos)
+        return seq
 
-        seq1, _ = await scheduler.add_request(SHORT_PROMPT, max_new_tokens=5)
-        seq2, _ = await scheduler.add_request(SHORT_PROMPT, max_new_tokens=5)
+    stopped = asyncio.run(generate(False))
+    assert stopped.finish_reason == "eos"
+    assert stopped.generated_token_ids == ref[:first_eos + 1]
+    full = asyncio.run(generate(True))
+    assert full.generated_token_ids == ref
 
-        # Drive scheduler until both sequences have moved past 'waiting'
-        deadline = time.perf_counter() + 120.0  # 2-minute safety net
-        for _ in range(30):
-            if time.perf_counter() > deadline:
-                break
-            await scheduler._schedule()
-            if seq1.state != "waiting" and seq2.state != "waiting":
-                break
 
-        # Either at least one sequence was swapped (not killed with OOM)...
-        any_swapped_ever = (
-            len(scheduler.swapped_out) > 0
-            or scheduler.cpu_swap_manager.stats()["total_swap_outs"] > 0
+def test_sampling_requests_complete(model):
+    scheduler = make_scheduler(model, speculative_method="ngram")
+    results = asyncio.run(run_all(
+        scheduler, [[1, 2, 3]] * 4, [10] * 4, temperature=0.8, top_p=0.9, top_k=20
+    ))
+    assert all(len(s.generated_token_ids) == 10 for s in results)
+    # sampled requests are never speculated
+    assert scheduler.spec_decode_stats()["draft_tokens"] == 0
+    assert_clean(scheduler)
+
+
+# ── Streaming, abort, timeouts ────────────────────────────────────────────────
+
+
+def test_streaming_delivers_every_token_then_none(model):
+    async def scenario():
+        scheduler = make_scheduler(model, speculative_method="ngram")
+        scheduler.start()
+        seq, future = await scheduler.add_request(
+            "", prompt_token_ids=[1, 2, 3, 4] * 4,
+            sampling=SamplingParams(max_new_tokens=15), stream=True,
         )
-        # ...or both finished legitimately (swap-in worked end-to-end)
-        any_oom = (
-            getattr(seq1, "finish_reason", "") == "oom"
-            and getattr(seq2, "finish_reason", "") == "oom"
-        )
+        received = []
+        while (chunk := await seq.stream.get()) is not None:
+            received.extend(chunk)
+        await future
+        await scheduler.stop()
+        return seq, received
 
-        assert any_swapped_ever or not any_oom, (
-            f"Expected a swap event or non-OOM completion. "
-            f"seq1.state={seq1.state!r} finish_reason={seq1.finish_reason!r}; "
-            f"seq2.state={seq2.state!r} finish_reason={seq2.finish_reason!r}; "
-            f"cpu_swap stats={scheduler.cpu_swap_manager.stats()}"
-        )
+    seq, received = asyncio.run(scenario())
+    assert received == seq.generated_token_ids
+    assert len(seq.token_times) == len(received)
+    assert seq.ttft_ms > 0 and seq.e2e_latency_ms >= seq.ttft_ms
 
-    asyncio.run(_run())
+
+def test_abort_running_request_frees_blocks(model):
+    async def scenario():
+        scheduler = make_scheduler(model)
+        scheduler.start()
+        seq, future = await scheduler.add_request(
+            "", prompt_token_ids=list(range(10)), sampling=SamplingParams(max_new_tokens=400)
+        )
+        while len(seq.generated_token_ids) < 3:
+            await asyncio.sleep(0.005)
+        await scheduler.abort(seq.seq_id)
+        finished = await future
+        await scheduler.stop()
+        return scheduler, finished
+
+    scheduler, seq = asyncio.run(scenario())
+    assert seq.finish_reason == "abort"
+    assert len(seq.generated_token_ids) < 400
+    assert_clean(scheduler)
+
+
+def test_abort_waiting_request_cancels_future(model):
+    async def scenario():
+        scheduler = make_scheduler(model)   # loop not started: request stays queued
+        seq, future = await scheduler.add_request("", prompt_token_ids=[1, 2])
+        await scheduler.abort(seq.seq_id)
+        assert future.cancelled()
+        assert seq.state == "cancelled"
+        assert len(scheduler.request_queue) == 0
+        await scheduler.stop()
+
+    asyncio.run(scenario())
+
+
+def test_queue_timeout_expires_request(model):
+    async def scenario():
+        scheduler = make_scheduler(model, request_timeout_ms=1.0)
+        seq, future = await scheduler.add_request("", prompt_token_ids=[1, 2])
+        await asyncio.sleep(0.01)
+        await scheduler.request_queue.expire_timed_out()
+        with pytest.raises(asyncio.TimeoutError):
+            await future
+        assert seq.state == "expired"
+        await scheduler.stop()
+
+    asyncio.run(scenario())
+
+
+def test_metrics_report_structure(model, workload):
+    prompts, lengths, _ = workload
+    scheduler = make_scheduler(model, speculative_method="ngram")
+    asyncio.run(run_all(scheduler, prompts[:6], lengths[:6]))
+    report = scheduler.get_metrics()
+    for key in ("system", "e2e_latency", "engine", "speculative_decoding",
+                "engine_steps", "paged_kv_cache", "cpu_swap", "queue_stats"):
+        assert key in report
+    latency = report["e2e_latency"]
+    assert {"ttft_ms", "itl_ms", "tpot_ms", "total_latency_ms", "queue_wait_ms"} <= set(latency)
+    assert latency["ttft_ms"]["p99"] >= latency["ttft_ms"]["p50"] > 0
+    assert report["engine_steps"]["total_steps"] > 0
+    assert report["system"]["requests_finished_total"] == 6
+
+
+# ── Real checkpoint (slow) ────────────────────────────────────────────────────
+
+
+@pytest.fixture(scope="module")
+def real_model():
+    from inference_engine.models.loader import load_model_and_tokenizer
+
+    try:
+        loaded = load_model_and_tokenizer(Config(device="cpu", dtype="float32"))
+    except Exception as exc:  # offline / not cached
+        pytest.skip(f"real checkpoint unavailable: {exc}")
+    return loaded
+
+
+@pytest.mark.slow
+def test_real_model_matches_hf_generate(real_model):
+    model, tokenizer, _ = real_model
+    prompts = ["The capital of France is", "def fibonacci(n):", "Water boils at"]
+    n = 24
+    refs = []
+    for p in prompts:
+        ids = tokenizer(p, return_tensors="pt")
+        out = model.generate(**ids, max_new_tokens=n, do_sample=False,
+                             pad_token_id=tokenizer.eos_token_id)
+        refs.append(out[0, ids.input_ids.shape[1]:].tolist())
+
+    async def scenario():
+        scheduler = ContinuousBatchingScheduler(
+            model, tokenizer, Config(device="cpu", dtype="float32", kv_num_blocks=256)
+        )
+        scheduler.start()
+        requests = [await scheduler.add_request(p, max_new_tokens=n) for p in prompts]
+        results = await asyncio.gather(*[f for _, f in requests])
+        await scheduler.stop()
+        return results
+
+    for seq, ref in zip(asyncio.run(scenario()), refs):
+        # fp32 batched vs unbatched numerics can flip a near-tie late in a
+        # generation; the first 16 tokens must agree exactly.
+        assert seq.generated_token_ids[:16] == ref[:16]
+
+
+def test_near_max_length_swapped_sequence_cannot_deadlock(model):
+    """Regression: a swapped-out sequence holding ~the whole pool can't be
+    swapped back in with room to grow.  It must fall back to recompute rather
+    than wait forever (which also blocked every later request)."""
+    prompts = [[1], [i % 97 for i in range(392)], [5, 6, 7]]
+    lengths = [30, 6, 2]
+    refs = [hf_greedy(model, p, n) for p, n in zip(prompts, lengths)]
+    scheduler = make_scheduler(
+        model, kv_num_blocks=100, prefill_budget_tokens=512, prefill_chunk_size=512,
+        preemption_mode="swap", enable_prefix_caching=False,
+    )
+
+    async def scenario():
+        return await asyncio.wait_for(run_all(scheduler, prompts, lengths), timeout=60)
+
+    results = asyncio.run(scenario())
+    assert [s.generated_token_ids for s in results] == refs
+    assert scheduler.num_preemptions_swap >= 1
+    assert_clean(scheduler)

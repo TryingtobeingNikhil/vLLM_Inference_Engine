@@ -16,7 +16,8 @@ health-checks and metrics endpoints remain responsive during long generations.
 
 Endpoints
 ---------
-POST /generate      Run inference; returns GenerationResult as JSON.
+POST /generate      Run inference; returns GenerationResult as JSON
+                    (``"stream": true`` streams tokens as Server-Sent Events).
 GET  /metrics       Returns last N results + summary statistics.
 GET  /health        Returns model name, device, and status.
 """
@@ -31,12 +32,20 @@ from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
+import json
+from datetime import datetime, timezone
+
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from inference_engine.config import Config
-from inference_engine.engine.sequential import GenerationResult, generate
+from inference_engine.engine.sequential import (
+    GenerationResult,
+    generate,
+    generate_stream,
+    get_memory_stats,
+)
 from inference_engine.metrics.collector import MetricsCollector
 from inference_engine.models.loader import LoadedModel, load_model_and_tokenizer
 
@@ -109,8 +118,10 @@ app = FastAPI(
 class GenerateRequest(BaseModel):
     prompt: str = Field(..., min_length=1, description="Input prompt text")
     max_new_tokens: int = Field(
-        default=50, ge=1, le=512, description="Maximum tokens to generate"
+        default=50, ge=1, le=16384, description="Maximum tokens to generate"
     )
+    ignore_eos: bool = Field(default=False, description="Always generate max_new_tokens")
+    stream: bool = False
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -121,7 +132,7 @@ def _result_to_dict(result: GenerationResult) -> dict:
     return dataclasses.asdict(result)
 
 
-def _run_generate(prompt: str, max_new_tokens: int) -> GenerationResult:
+def _run_generate(prompt: str, max_new_tokens: int, ignore_eos: bool = False) -> GenerationResult:
     """
     Blocking wrapper that calls generate().
 
@@ -137,7 +148,70 @@ def _run_generate(prompt: str, max_new_tokens: int) -> GenerationResult:
         prompt=prompt,
         max_new_tokens=max_new_tokens,
         device=_loaded_model.device,
+        eos_token_id=None if ignore_eos else "tokenizer",
     )
+
+
+async def _stream_generate(request: GenerateRequest):
+    """Sequential streaming: hold the lock for the whole generation, push each
+    token to the client as the worker thread produces it."""
+    assert _loaded_model is not None and _collector is not None
+    t_arrival = time.perf_counter()
+    async with inference_lock:
+        t_start = time.perf_counter()
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue = asyncio.Queue()
+        stop = False
+
+        def worker() -> None:
+            try:
+                for token_id in generate_stream(
+                    _loaded_model.model,
+                    _loaded_model.tokenizer,
+                    request.prompt,
+                    request.max_new_tokens,
+                    eos_token_id=None if request.ignore_eos else _loaded_model.tokenizer.eos_token_id,
+                ):
+                    loop.call_soon_threadsafe(queue.put_nowait, (time.perf_counter(), token_id))
+                    if stop:
+                        break
+            finally:
+                loop.call_soon_threadsafe(queue.put_nowait, None)
+
+        work = loop.run_in_executor(_executor, worker)
+        token_ids, times = [], []
+        try:
+            while (item := await queue.get()) is not None:
+                t_token, token_id = item
+                token_ids.append(token_id)
+                times.append(t_token)
+                yield f"data: {json.dumps({'token_ids': [token_id]})}\n\n"
+        finally:
+            stop = True
+            await work
+
+    tokenizer = _loaded_model.tokenizer
+    total_ms = (times[-1] - t_arrival) * 1000.0 if times else 0.0
+    allocated_mb, reserved_mb = get_memory_stats(_loaded_model.device)
+    result = GenerationResult(
+        prompt=request.prompt,
+        generated_text=tokenizer.decode(token_ids, skip_special_tokens=True),
+        prompt_tokens=len(tokenizer(request.prompt)["input_ids"]),
+        generated_tokens=len(token_ids),
+        ttft_ms=(times[0] - t_arrival) * 1000.0 if times else 0.0,
+        total_latency_ms=total_ms,
+        tokens_per_second=len(token_ids) / total_ms * 1000.0 if total_ms > 0 else 0.0,
+        per_token_latencies_ms=[(b - a) * 1000.0 for a, b in zip(times, times[1:])],
+        gpu_memory_allocated_mb=allocated_mb,
+        gpu_memory_reserved_mb=reserved_mb,
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        queue_wait_time_ms=(t_start - t_arrival) * 1000.0,
+    )
+    _collector.append(result)
+    final = dataclasses.asdict(result)
+    final["done"] = True
+    yield f"data: {json.dumps(final)}\n\n"
+    yield "data: [DONE]\n\n"
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
@@ -154,19 +228,29 @@ async def endpoint_generate(request: GenerateRequest):
     if _loaded_model is None or _collector is None:
         raise HTTPException(status_code=503, detail="Model not ready")
 
+    if request.stream:
+        return StreamingResponse(_stream_generate(request), media_type="text/event-stream")
+
+    t_arrival = time.perf_counter()
     async with inference_lock:
-        loop = asyncio.get_event_loop()
+        wait_ms = (time.perf_counter() - t_arrival) * 1000.0
+        loop = asyncio.get_running_loop()
         try:
             result: GenerationResult = await loop.run_in_executor(
                 _executor,
                 _run_generate,
                 request.prompt,
                 request.max_new_tokens,
+                request.ignore_eos,
             )
         except Exception as exc:
             logger.exception("Inference error: %s", exc)
             raise HTTPException(status_code=500, detail="Generation failed") from exc
 
+    # generate() times only the model work; a client also waited for the lock.
+    result.queue_wait_time_ms = wait_ms
+    result.ttft_ms += wait_ms
+    result.total_latency_ms += wait_ms
     _collector.append(result)
 
     return JSONResponse(content=_result_to_dict(result))

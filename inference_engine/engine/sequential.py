@@ -28,7 +28,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import List, Optional, Tuple
+from typing import Iterator, List, Optional, Sequence, Tuple
 
 import psutil
 import torch
@@ -63,6 +63,16 @@ class GenerationResult:
 
     # ISO-8601 UTC timestamp when generate() was called
     timestamp: str
+
+    # Fields populated by the continuous-batching engine (defaults keep the
+    # Phase 1 constructor and JSON schema backwards compatible).
+    finish_reason: str = ""
+    queue_wait_time_ms: float = 0.0
+    tpot_ms: float = 0.0
+    cached_prompt_tokens: int = 0
+    num_preemptions: int = 0
+    spec_draft_tokens: int = 0
+    spec_accepted_tokens: int = 0
 
 
 # ── Memory helpers ────────────────────────────────────────────────────────────
@@ -181,12 +191,20 @@ def prefill(
 # ── Decode ────────────────────────────────────────────────────────────────────
 
 
+def _is_eos(token_id: int, eos_token_id) -> bool:
+    if eos_token_id is None:
+        return False
+    if isinstance(eos_token_id, int):
+        return token_id == eos_token_id
+    return token_id in eos_token_id
+
+
 def decode(
     model: PreTrainedModel,
     past_key_values: object,
     first_token_id: int,
     max_new_tokens: int,
-    eos_token_id: Optional[int] = None,
+    eos_token_id=None,
 ) -> Tuple[List[int], List[float]]:
     """
     Autoregressive decode loop starting from *first_token_id*.
@@ -212,7 +230,7 @@ def decode(
 
     current_token = torch.tensor([[first_token_id]], dtype=torch.long, device=device)
 
-    if eos_token_id is not None and first_token_id == eos_token_id:
+    if _is_eos(first_token_id, eos_token_id):
         return generated_ids, per_token_latencies_ms
 
     for step in range(max_new_tokens - 1):  # -1 because first token already counted
@@ -237,7 +255,7 @@ def decode(
         current_token = torch.tensor([[next_token_id]], dtype=torch.long, device=device)
 
         # EOS check
-        if eos_token_id is not None and next_token_id == eos_token_id:
+        if _is_eos(next_token_id, eos_token_id):
             logger.debug("decode: EOS hit at step %d", step + 1)
             break
 
@@ -253,12 +271,42 @@ def decode(
 # ── Generate (orchestrator) ───────────────────────────────────────────────────
 
 
+def generate_stream(
+    model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizerBase,
+    prompt: str,
+    max_new_tokens: int,
+    eos_token_id=None,
+) -> Iterator[int]:
+    """Same prefill → decode loop as :func:`generate`, yielding each token id
+    as soon as it is produced (used by the streaming Phase 1 endpoint)."""
+    if max_new_tokens < 1:
+        raise ValueError("max_new_tokens must be at least 1")
+    device = next(model.parameters()).device
+    past_key_values, token_id, _ = prefill(model, tokenizer, prompt)
+    yield token_id
+    for _ in range(max_new_tokens - 1):
+        if _is_eos(token_id, eos_token_id):
+            return
+        with torch.inference_mode():
+            outputs = model(
+                input_ids=torch.tensor([[token_id]], dtype=torch.long, device=device),
+                past_key_values=past_key_values,
+                use_cache=True,
+                return_dict=True,
+            )
+        past_key_values = outputs.past_key_values
+        token_id = int(outputs.logits[:, -1, :].argmax(dim=-1).item())
+        yield token_id
+
+
 def generate(
     model: PreTrainedModel,
     tokenizer: PreTrainedTokenizerBase,
     prompt: str,
     max_new_tokens: int,
     device: str,
+    eos_token_id="tokenizer",
 ) -> GenerationResult:
     """
     Full prefill → decode pipeline.  Returns a fully-populated GenerationResult.
@@ -285,7 +333,7 @@ def generate(
         past_key_values=past_key_values,
         first_token_id=first_token_id,
         max_new_tokens=max_new_tokens,
-        eos_token_id=tokenizer.eos_token_id,
+        eos_token_id=tokenizer.eos_token_id if eos_token_id == "tokenizer" else eos_token_id,
     )
 
     total_latency_ms = (time.perf_counter() - t_total_start) * 1000.0

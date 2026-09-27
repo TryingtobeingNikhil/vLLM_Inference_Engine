@@ -151,8 +151,7 @@ class RequestQueue:
             if len(self._queue) >= self.maxsize:
                 raise QueueFullError(self.maxsize)
 
-            loop = asyncio.get_event_loop()
-            fut: asyncio.Future = loop.create_future()
+            fut: asyncio.Future = asyncio.get_running_loop().create_future()
 
             item = QueuedRequest(
                 sequence=sequence,
@@ -186,6 +185,18 @@ class RequestQueue:
                 return None
             item = self._queue.pop(0)
             return item
+
+    async def requeue_front(self, item: QueuedRequest) -> None:
+        """Put a dequeued request back at the head of the queue.
+
+        Used when the scheduler dequeues a request but cannot admit it yet
+        (not enough free KV blocks).  The original enqueue_time is kept, so
+        the timeout clock keeps running and FIFO order is preserved.
+        """
+        async with self._lock:
+            if item.future.done():
+                return
+            self._queue.insert(0, item)
 
     def mark_admitted(self) -> None:
         """Record that one dequeued request entered the scheduler."""
@@ -238,8 +249,8 @@ class RequestQueue:
         """Cancel a waiting request by seq_id.
 
         If the request is found in the queue and not already in a terminal
-        state, sets its state to ``"cancelled"``, resolves the future with
-        asyncio.CancelledError, removes it from the queue, and returns True.
+        state, sets its state to ``"cancelled"``, cancels its future, removes
+        it from the queue, and returns True.
 
         Returns False if no matching request is found or it has already been
         removed (e.g. already admitted or expired).
@@ -251,12 +262,9 @@ class RequestQueue:
                     if item.sequence.state not in ("expired", "cancelled",
                                                    "decoding", "finished"):
                         item.sequence.state = "cancelled"
+                        item.sequence.finish_reason = "abort"
                         if not item.future.done():
-                            item.future.set_exception(
-                                asyncio.CancelledError(
-                                    f"Request {seq_id} cancelled"
-                                )
-                            )
+                            item.future.cancel()
                     del self._queue[i]
                     return True
 
