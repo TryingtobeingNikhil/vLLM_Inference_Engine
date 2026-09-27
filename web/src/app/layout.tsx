@@ -16,11 +16,8 @@ export const metadata: Metadata = {
   title: 'PageServe — LLM Inference Engine',
   description:
     'A production-grade LLM inference engine built from first principles: continuous batching, paged KV cache, chunked prefill, and CPU swap pool.',
-  icons: {
-    icon: '/favicon.png',
-    shortcut: '/favicon.png',
-    apple: '/favicon.png',
-  },
+  // Favicons come from the file conventions in this folder:
+  // icon.svg (modern browsers), favicon.ico (fallback), apple-icon.png (iOS/Safari).
   openGraph: {
     title: 'PageServe — LLM Inference Engine',
     description:
