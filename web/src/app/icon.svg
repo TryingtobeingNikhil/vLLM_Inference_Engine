@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#16181D"/>
+      <stop offset="1" stop-color="#07080A"/>
+    </linearGradient>
+  </defs>
+  <!-- Tile keeps the mark readable on light and dark tab bars -->
+  <rect width="32" height="32" rx="8" fill="url(#bg)"/>
+  <rect x="0.5" y="0.5" width="31" height="31" rx="7.5" fill="none" stroke="#FFFFFF" stroke-opacity="0.1"/>
+  <!-- Three owned KV blocks + one being paged in -->
+  <rect x="7" y="7" width="8" height="8" rx="2.2" fill="#4ADE80"/>
+  <rect x="17" y="7" width="8" height="8" rx="2.2" fill="#60A5FA"/>
+  <rect x="7" y="17" width="8" height="8" rx="2.2" fill="#A78BFA"/>
+  <rect x="17.75" y="17.75" width="6.5" height="6.5" rx="1.8" fill="none" stroke="#FBBF24" stroke-width="1.5" stroke-dasharray="2.2 1.5"/>
+</svg>
