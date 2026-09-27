@@ -15,8 +15,10 @@ percentiles, GPU memory and utilisation.  Each suite isolates one idea:
   prefix     long shared system prompt + short unique questions
              engine             prefix caching off
              engine+prefix      automatic prefix caching on
-  spec       copy-heavy prompts (and random prompts, to show the cost when
-             drafts are bad)
+  spec       copy-heavy prompts, and ordinary chat questions — outputs end
+             naturally at EOS (speculation is exact, so every system emits
+             the same text; forcing fixed lengths past EOS makes models loop
+             and would inflate draft acceptance)
              engine             no speculation
              engine+ngram       n-gram / prompt-lookup speculation
              engine+draft       draft-model speculation (--draft-model)
@@ -78,9 +80,12 @@ SUITES = {
     "prefix": [("shared_prefix", ["engine", "engine+prefix"])],
     "spec": [
         ("repetitive", ["engine", "engine+ngram", "engine+draft"]),
-        ("random", ["engine", "engine+ngram", "engine+draft"]),
+        ("chat", ["engine", "engine+ngram", "engine+draft"]),
     ],
 }
+
+# Suites whose outputs stop naturally at EOS instead of at a forced length.
+NATURAL_STOP_SUITES = {"spec"}
 
 # Systems too slow to push the whole workload through: they run a prefix of
 # it and report throughput from that subset.
@@ -181,7 +186,7 @@ def run_hf_static_batch(model, tokenizer, device, items, batch_size: int) -> dic
 
 
 def run_engine(model, tokenizer, device, items, overrides: dict, base: dict,
-               draft_model=None) -> dict:
+               draft_model=None, ignore_eos: bool = True) -> dict:
     config = Config(**{**base, **overrides})
     _reset_peak(device)
     scheduler = ContinuousBatchingScheduler(model, tokenizer, config, draft_model=draft_model)
@@ -198,7 +203,7 @@ def run_engine(model, tokenizer, device, items, overrides: dict, base: dict,
             pending = [
                 await scheduler.add_request(
                     it.prompt, sampling=SamplingParams(max_new_tokens=it.max_new_tokens,
-                                                       ignore_eos=True))
+                                                       ignore_eos=ignore_eos))
                 for it in items
             ]
             seqs = await asyncio.gather(*[f for _, f in pending])
@@ -364,7 +369,8 @@ def main() -> None:
                     else:
                         metrics = run_engine(model, tokenizer, device, subset,
                                              ENGINE_SYSTEMS[system], base,
-                                             draft_model if system == "engine+draft" else None)
+                                             draft_model if system == "engine+draft" else None,
+                                             ignore_eos=suite not in NATURAL_STOP_SUITES)
                 except torch.cuda.OutOfMemoryError as exc:
                     print(f"  OOM: {exc}")
                     metrics = {"error": "out of memory", "output_tok_s": 0.0}
@@ -374,7 +380,8 @@ def main() -> None:
                              "metrics": metrics})
             payload["runs"].extend(runs)
             ok_runs = [r for r in runs if "error" not in r["metrics"]]
-            markdown.append(suite_markdown(f"{suite}: {workload_name} workload", ok_runs))
+            stop = "outputs end at EOS" if suite in NATURAL_STOP_SUITES else "fixed output lengths"
+            markdown.append(suite_markdown(f"{suite}: {workload_name} workload ({stop})", ok_runs))
 
     stem = f"offline_{gpu_tag()}_{time.strftime('%Y%m%d-%H%M%S')}"
     json_path = save_results(payload, args.output_dir, stem)
