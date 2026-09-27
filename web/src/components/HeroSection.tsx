@@ -9,7 +9,7 @@ import { CountUp } from '@/components/ui/CountUp';
 import { StarButton } from '@/components/GitHubStats';
 import { BlockField } from '@/components/BlockField';
 import { DEMO_CONFIG, TESTS_PASSING, TOTAL_PHASES } from '@/data/engine';
-import { SMOKE_HIGHLIGHTS } from '@/data/gpuBenchmarks';
+import { HEADLINE_HIGHLIGHTS } from '@/data/gpuBenchmarks';
 import type { SimSequence, SeqState } from '@/data/simulation';
 
 const STATE_LABELS: Record<SeqState, string> = {
@@ -284,10 +284,10 @@ export function HeroSection() {
         </p>
       </div>
 
-      {/* Headline numbers — v3 local smoke runs, labelled as such */}
+      {/* Headline numbers — measured on an NVIDIA T4 (Colab) */}
       <div className="relative mx-5 mt-14 max-w-5xl sm:mx-6 lg:mx-auto">
         <div className="grid grid-cols-2 gap-px overflow-hidden rounded-2xl border border-line bg-line sm:grid-cols-4">
-          {SMOKE_HIGHLIGHTS.map((h, i) => (
+          {HEADLINE_HIGHLIGHTS.map((h, i) => (
             <HeroStat
               key={h.label}
               value={h.ratio ? <CountUp value={h.ratio} decimals={1} suffix="×" /> : '–'}
@@ -298,9 +298,9 @@ export function HeroSection() {
           ))}
         </div>
         <p className="mt-3 flex flex-wrap items-center justify-between gap-2 font-mono text-[11px] text-fg-4">
-          <span>Small local smoke runs · Apple M2 (MPS) · Qwen2-0.5B fp16 · not headline GPU results</span>
-          <a href="#tested" className="text-fg-3 underline decoration-line-2 underline-offset-4 transition-colors hover:text-fg">
-            GPU benchmarks coming from Colab →
+          <span>NVIDIA T4 (Colab) · Qwen2.5-1.5B-Instruct fp16 · offline ablation · output tokens/s</span>
+          <a href="#benchmarks" className="text-fg-3 underline decoration-line-2 underline-offset-4 transition-colors hover:text-fg">
+            Full T4 results →
           </a>
         </p>
       </div>

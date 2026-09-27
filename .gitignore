@@ -11,5 +11,5 @@ web/out/
 web/.env*.local
 
 # Benchmark outputs
-results/
+/results/
 load_test_report.json

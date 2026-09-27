@@ -1,0 +1,1237 @@
+{
+  "system": {
+    "timestamp": "2026-09-27 19:07:48",
+    "python": "3.13.15",
+    "torch": "2.11.0+cu128",
+    "transformers": "5.16.1",
+    "platform": "Linux-6.6.122+-x86_64-with-glibc2.39",
+    "device": "cuda",
+    "gpu": "Tesla T4",
+    "gpu_memory_gb": 14.6,
+    "cuda": "12.8",
+    "compute_capability": "7.5",
+    "git_commit": "f168063",
+    "model": "Qwen/Qwen2.5-1.5B-Instruct"
+  },
+  "args": {
+    "model": "auto",
+    "draft_model": "auto",
+    "configs": "sequential,continuous,prefix",
+    "workload": "random",
+    "num_requests": 200,
+    "sequential_requests": 24,
+    "input_len": [
+      256,
+      512
+    ],
+    "output_len": [
+      128,
+      256
+    ],
+    "rates": [
+      2,
+      4,
+      8,
+      16,
+      Infinity
+    ],
+    "concurrency": null,
+    "natural_stop": false,
+    "slo_ttft_ms": 2000.0,
+    "slo_tpot_ms": 100.0,
+    "port": 8001,
+    "server_env": [],
+    "startup_timeout": 1800.0,
+    "seed": 0,
+    "output_dir": "results"
+  },
+  "configs": {
+    "sequential": {
+      "env": {
+        "MODEL_NAME": "Qwen/Qwen2.5-1.5B-Instruct",
+        "REQUEST_TIMEOUT_MS": "3600000",
+        "MAX_QUEUE_SIZE": "264",
+        "METRICS_OUTPUT_PATH": "results/serving_Tesla-T4_20260927-190748_sequential_metrics.json"
+      },
+      "levels": [
+        {
+          "label": "2/s",
+          "rate": 2,
+          "concurrency": null,
+          "report": {
+            "total_requests": 24,
+            "successful": 24,
+            "failed": 0,
+            "success_rate_pct": 100.0,
+            "test_duration_s": 174.143859303,
+            "throughput_requests_per_sec": 0.13781709039904427,
+            "throughput_tokens_per_sec": 26.748000294947843,
+            "throughput_input_tokens_per_sec": 50.98083869011313,
+            "total_output_tokens": 4658,
+            "total_input_tokens": 8878,
+            "cached_prompt_tokens": 0,
+            "goodput": {
+              "slo_ttft_ms": 2000.0,
+              "slo_tpot_ms": 100.0,
+              "requests_meeting_slo": 1,
+              "pct": 4.166666666666667,
+              "requests_per_sec": 0.005742378766626846
+            },
+            "latency": {
+              "ttft_ms": {
+                "p50": 77163.07467179581,
+                "p90": 137346.8258711071,
+                "p95": 145834.64371090522,
+                "p99": 152159.04998782589,
+                "mean": 76897.18761343481
+              },
+              "total_latency_ms": {
+                "p50": 85008.0504422957,
+                "p90": 145032.22137910713,
+                "p95": 153685.20093935513,
+                "p99": 158384.54484528585,
+                "mean": 84061.94687951816
+              },
+              "tpot_ms": {
+                "p50": 37.50997481661727,
+                "p90": 38.691077800144534,
+                "p95": 39.58893885014418,
+                "p99": 39.822210107410164,
+                "mean": 37.073168356336666
+              },
+              "itl_ms": {
+                "p50": 34.54943600002025,
+                "p90": 45.94341269998949,
+                "p95": 50.38039135004054,
+                "p99": 56.475203520110426,
+                "mean": 37.107082949072094
+              }
+            },
+            "errors": {},
+            "gpu": {
+              "available": true,
+              "gpu_name": "Tesla T4",
+              "num_samples": 863,
+              "util_mean_pct": 52.12282734646582,
+              "util_p50_pct": 54.0,
+              "util_max_pct": 77.0,
+              "mem_used_max_mb": 3708.1875,
+              "mem_total_mb": 15360.0
+            },
+            "engine": {}
+          }
+        },
+        {
+          "label": "4/s",
+          "rate": 4,
+          "concurrency": null,
+          "report": {
+            "total_requests": 24,
+            "successful": 24,
+            "failed": 0,
+            "success_rate_pct": 100.0,
+            "test_duration_s": 174.76513523799986,
+            "throughput_requests_per_sec": 0.13732716177809812,
+            "throughput_tokens_per_sec": 26.727298861062344,
+            "throughput_input_tokens_per_sec": 53.69492025523636,
+            "total_output_tokens": 4671,
+            "total_input_tokens": 9384,
+            "cached_prompt_tokens": 0,
+            "goodput": {
+              "slo_ttft_ms": 2000.0,
+              "slo_tpot_ms": 100.0,
+              "requests_meeting_slo": 1,
+              "pct": 4.166666666666667,
+              "requests_per_sec": 0.005721965074087421
+            },
+            "latency": {
+              "ttft_ms": {
+                "p50": 81002.42938989788,
+                "p90": 144200.20202420367,
+                "p95": 153847.57992520268,
+                "p99": 160047.3971856479,
+                "mean": 80367.59968615496
+              },
+              "total_latency_ms": {
+                "p50": 87260.62541589794,
+                "p90": 152831.0395092036,
+                "p95": 160993.12771040268,
+                "p99": 166168.59711720797,
+                "mean": 87555.75302707164
+              },
+              "tpot_ms": {
+                "p50": 37.59620058524836,
+                "p90": 38.98892201752315,
+                "p95": 39.13281785899115,
+                "p99": 39.25692497821287,
+                "mean": 37.11804226031732
+              },
+              "itl_ms": {
+                "p50": 34.570870000152354,
+                "p90": 45.59189939991486,
+                "p95": 50.75471029997516,
+                "p99": 57.61150453995015,
+                "mean": 37.124097306219134
+              }
+            },
+            "errors": {},
+            "gpu": {
+              "available": true,
+              "gpu_name": "Tesla T4",
+              "num_samples": 866,
+              "util_mean_pct": 52.518475750577366,
+              "util_p50_pct": 54.0,
+              "util_max_pct": 80.0,
+              "mem_used_max_mb": 3730.1875,
+              "mem_total_mb": 15360.0
+            },
+            "engine": {}
+          }
+        },
+        {
+          "label": "8/s",
+          "rate": 8,
+          "concurrency": null,
+          "report": {
+            "total_requests": 24,
+            "successful": 24,
+            "failed": 0,
+            "success_rate_pct": 100.0,
+            "test_duration_s": 174.77350350099982,
+            "throughput_requests_per_sec": 0.13732058646900502,
+            "throughput_tokens_per_sec": 26.726019141530106,
+            "throughput_input_tokens_per_sec": 51.56388021911139,
+            "total_output_tokens": 4671,
+            "total_input_tokens": 9012,
+            "cached_prompt_tokens": 0,
+            "goodput": {
+              "slo_ttft_ms": 2000.0,
+              "slo_tpot_ms": 100.0,
+              "requests_meeting_slo": 1,
+              "pct": 4.166666666666667,
+              "requests_per_sec": 0.005721691102875209
+            },
+            "latency": {
+              "ttft_ms": {
+                "p50": 80808.30959244884,
+                "p90": 145233.10718750177,
+                "p95": 155607.6097142262,
+                "p99": 163490.99525131393,
+                "mean": 80215.24077372323
+              },
+              "total_latency_ms": {
+                "p50": 88133.57028794894,
+                "p90": 154284.75228590175,
+                "p95": 164354.67976992618,
+                "p99": 169833.90497424395,
+                "mean": 87405.01477134823
+              },
+              "tpot_ms": {
+                "p50": 37.61659017840222,
+                "p90": 39.406170434565006,
+                "p95": 39.66747795183103,
+                "p99": 39.741103428057095,
+                "mean": 37.202530695867644
+              },
+              "itl_ms": {
+                "p50": 34.507549999943876,
+                "p90": 45.892776400023656,
+                "p95": 50.804352599925544,
+                "p99": 57.083237999963785,
+                "mean": 37.1324673860555
+              }
+            },
+            "errors": {},
+            "gpu": {
+              "available": true,
+              "gpu_name": "Tesla T4",
+              "num_samples": 866,
+              "util_mean_pct": 52.210161662817555,
+              "util_p50_pct": 54.0,
+              "util_max_pct": 82.0,
+              "mem_used_max_mb": 3730.1875,
+              "mem_total_mb": 15360.0
+            },
+            "engine": {}
+          }
+        },
+        {
+          "label": "16/s",
+          "rate": 16,
+          "concurrency": null,
+          "report": {
+            "total_requests": 24,
+            "successful": 24,
+            "failed": 0,
+            "success_rate_pct": 100.0,
+            "test_duration_s": 178.86990573499997,
+            "throughput_requests_per_sec": 0.1341757290103153,
+            "throughput_tokens_per_sec": 26.700970073052744,
+            "throughput_input_tokens_per_sec": 52.501844630661296,
+            "total_output_tokens": 4776,
+            "total_input_tokens": 9391,
+            "cached_prompt_tokens": 0,
+            "goodput": {
+              "slo_ttft_ms": 2000.0,
+              "slo_tpot_ms": 100.0,
+              "requests_meeting_slo": 1,
+              "pct": 4.166666666666667,
+              "requests_per_sec": 0.005590655375429804
+            },
+            "latency": {
+              "ttft_ms": {
+                "p50": 86686.24991672437,
+                "p90": 156114.0612938008,
+                "p95": 162689.11743261304,
+                "p99": 167277.9476795569,
+                "mean": 85588.75997856997
+              },
+              "total_latency_ms": {
+                "p50": 93044.11330972437,
+                "p90": 161980.04120580087,
+                "p95": 167744.82437531304,
+                "p99": 175052.69682716683,
+                "mean": 92946.98429827827
+              },
+              "tpot_ms": {
+                "p50": 37.2523401761782,
+                "p90": 38.498272174869406,
+                "p95": 38.82502026377651,
+                "p99": 38.99675323804476,
+                "mean": 37.11596634873168
+              },
+              "itl_ms": {
+                "p50": 34.618713999975625,
+                "p90": 45.549383700040394,
+                "p95": 50.60403540005609,
+                "p99": 57.07708974002343,
+                "mean": 37.16274908943593
+              }
+            },
+            "errors": {},
+            "gpu": {
+              "available": true,
+              "gpu_name": "Tesla T4",
+              "num_samples": 886,
+              "util_mean_pct": 52.39277652370203,
+              "util_p50_pct": 54.0,
+              "util_max_pct": 81.0,
+              "mem_used_max_mb": 3732.1875,
+              "mem_total_mb": 15360.0
+            },
+            "engine": {}
+          }
+        },
+        {
+          "label": "inf",
+          "rate": Infinity,
+          "concurrency": null,
+          "report": {
+            "total_requests": 24,
+            "successful": 24,
+            "failed": 0,
+            "success_rate_pct": 100.0,
+            "test_duration_s": 172.37853000099994,
+            "throughput_requests_per_sec": 0.13922847584244266,
+            "throughput_tokens_per_sec": 26.749270921229297,
+            "throughput_input_tokens_per_sec": 55.40133101230531,
+            "total_output_tokens": 4611,
+            "total_input_tokens": 9550,
+            "cached_prompt_tokens": 0,
+            "goodput": {
+              "slo_ttft_ms": 2000.0,
+              "slo_tpot_ms": 100.0,
+              "requests_meeting_slo": 1,
+              "pct": 4.166666666666667,
+              "requests_per_sec": 0.005801186493435111
+            },
+            "latency": {
+              "ttft_ms": {
+                "p50": 80132.74932499995,
+                "p90": 146312.0448157,
+                "p95": 156504.8736536998,
+                "p99": 162403.67684093985,
+                "mean": 79926.07985229166
+              },
+              "total_latency_ms": {
+                "p50": 87242.79755700001,
+                "p90": 155068.9650465,
+                "p95": 162763.8815771998,
+                "p99": 170345.89168331004,
+                "mean": 87010.2821020833
+              },
+              "tpot_ms": {
+                "p50": 37.69885605675367,
+                "p90": 39.22821781488423,
+                "p95": 39.56144750544856,
+                "p99": 39.66721506207381,
+                "mean": 37.052596457829004
+              },
+              "itl_ms": {
+                "p50": 34.492990999979156,
+                "p90": 45.68038859997615,
+                "p95": 50.61142010010826,
+                "p99": 56.80225725991477,
+                "mean": 37.065806408327816
+              }
+            },
+            "errors": {},
+            "gpu": {
+              "available": true,
+              "gpu_name": "Tesla T4",
+              "num_samples": 854,
+              "util_mean_pct": 52.74473067915691,
+              "util_p50_pct": 55.0,
+              "util_max_pct": 82.0,
+              "mem_used_max_mb": 3732.1875,
+              "mem_total_mb": 15360.0
+            },
+            "engine": {}
+          }
+        }
+      ]
+    },
+    "continuous": {
+      "env": {
+        "MODEL_NAME": "Qwen/Qwen2.5-1.5B-Instruct",
+        "ENABLE_PREFIX_CACHING": "0",
+        "REQUEST_TIMEOUT_MS": "3600000",
+        "MAX_QUEUE_SIZE": "264",
+        "METRICS_OUTPUT_PATH": "results/serving_Tesla-T4_20260927-190748_continuous_metrics.json"
+      },
+      "levels": [
+        {
+          "label": "2/s",
+          "rate": 2,
+          "concurrency": null,
+          "report": {
+            "total_requests": 200,
+            "successful": 200,
+            "failed": 0,
+            "success_rate_pct": 100.0,
+            "test_duration_s": 112.86499489900007,
+            "throughput_requests_per_sec": 1.772028609747201,
+            "throughput_tokens_per_sec": 339.56498234280735,
+            "throughput_input_tokens_per_sec": 669.4989891916387,
+            "total_output_tokens": 38325,
+            "total_input_tokens": 75563,
+            "cached_prompt_tokens": 0,
+            "goodput": {
+              "slo_ttft_ms": 2000.0,
+              "slo_tpot_ms": 100.0,
+              "requests_meeting_slo": 200,
+              "pct": 100.0,
+              "requests_per_sec": 1.772028609747201
+            },
+            "latency": {
+              "ttft_ms": {
+                "p50": 112.31800440782536,
+                "p90": 165.59000629285947,
+                "p95": 189.7085064528027,
+                "p99": 233.42668515713729,
+                "mean": 119.54601042092918
+              },
+              "total_latency_ms": {
+                "p50": 9542.258759928473,
+                "p90": 12185.06015106359,
+                "p95": 12859.897693335868,
+                "p99": 13310.866943061721,
+                "mean": 9540.785095405923
+              },
+              "tpot_ms": {
+                "p50": 49.81679379056062,
+                "p90": 52.82709776750532,
+                "p95": 53.43037061454808,
+                "p99": 54.268883965864084,
+                "mean": 49.39449068796745
+              },
+              "itl_ms": {
+                "p50": 44.2075260002639,
+                "p90": 65.84714159989741,
+                "p95": 75.44713039997075,
+                "p99": 105.14731368013601,
+                "mean": 49.42289356057702
+              }
+            },
+            "errors": {},
+            "gpu": {
+              "available": true,
+              "gpu_name": "Tesla T4",
+              "num_samples": 559,
+              "util_mean_pct": 58.80500894454383,
+              "util_p50_pct": 59.0,
+              "util_max_pct": 94.0,
+              "mem_used_max_mb": 12746.1875,
+              "mem_total_mb": 15360.0
+            },
+            "engine": {
+              "interval": "since previous snapshot",
+              "prefix_cache_hit_rate": null,
+              "preemptions_swap": 0,
+              "preemptions_recompute": 0,
+              "spec_acceptance_rate": null,
+              "engine_steps": 2323,
+              "avg_batch_size": 16.498062849763237,
+              "avg_tokens_per_step": 48.94016358157555,
+              "avg_kv_utilization": 0.0239258805787977,
+              "gpu_memory": {
+                "allocated_mb": 12033.77783203125,
+                "reserved_mb": 12154.0,
+                "max_allocated_mb": 12108.28662109375
+              }
+            }
+          }
+        },
+        {
+          "label": "4/s",
+          "rate": 4,
+          "concurrency": null,
+          "report": {
+            "total_requests": 200,
+            "successful": 200,
+            "failed": 0,
+            "success_rate_pct": 100.0,
+            "test_duration_s": 64.60837260200014,
+            "throughput_requests_per_sec": 3.095574024624301,
+            "throughput_tokens_per_sec": 603.931014334078,
+            "throughput_input_tokens_per_sec": 1192.3377249346652,
+            "total_output_tokens": 39019,
+            "total_input_tokens": 77035,
+            "cached_prompt_tokens": 0,
+            "goodput": {
+              "slo_ttft_ms": 2000.0,
+              "slo_tpot_ms": 100.0,
+              "requests_meeting_slo": 200,
+              "pct": 100.0,
+              "requests_per_sec": 3.095574024624301
+            },
+            "latency": {
+              "ttft_ms": {
+                "p50": 145.82056783933695,
+                "p90": 250.03692181935548,
+                "p95": 792.1577329449055,
+                "p99": 1231.0714560710355,
+                "mean": 207.0223345531281
+              },
+              "total_latency_ms": {
+                "p50": 12253.755004998766,
+                "p90": 15179.816608505325,
+                "p95": 16193.756046217502,
+                "p99": 17099.132987434252,
+                "mean": 12208.622476443117
+              },
+              "tpot_ms": {
+                "p50": 60.86263243924417,
+                "p90": 70.34382673601748,
+                "p95": 71.33693928941481,
+                "p99": 72.37079935000811,
+                "mean": 61.878865125033606
+              },
+              "itl_ms": {
+                "p50": 52.20116999998936,
+                "p90": 94.15499519991504,
+                "p95": 111.95922730007615,
+                "p99": 171.5158907800469,
+                "mean": 61.83363889791076
+              }
+            },
+            "errors": {},
+            "gpu": {
+              "available": true,
+              "gpu_name": "Tesla T4",
+              "num_samples": 319,
+              "util_mean_pct": 69.84012539184953,
+              "util_p50_pct": 72.0,
+              "util_max_pct": 96.0,
+              "mem_used_max_mb": 12746.1875,
+              "mem_total_mb": 15360.0
+            },
+            "engine": {
+              "interval": "since previous snapshot",
+              "prefix_cache_hit_rate": null,
+              "preemptions_swap": 0,
+              "preemptions_recompute": 0,
+              "spec_acceptance_rate": null,
+              "engine_steps": 1111,
+              "avg_batch_size": 35.120612061206124,
+              "avg_tokens_per_step": 104.27902790279028,
+              "avg_kv_utilization": 0.051810264464278034,
+              "gpu_memory": {
+                "allocated_mb": 12033.77783203125,
+                "reserved_mb": 12154.0,
+                "max_allocated_mb": 12108.3017578125
+              }
+            }
+          }
+        },
+        {
+          "label": "8/s",
+          "rate": 8,
+          "concurrency": null,
+          "report": {
+            "total_requests": 200,
+            "successful": 200,
+            "failed": 0,
+            "success_rate_pct": 100.0,
+            "test_duration_s": 54.18046208299984,
+            "throughput_requests_per_sec": 3.691367557803717,
+            "throughput_tokens_per_sec": 703.3162607883422,
+            "throughput_input_tokens_per_sec": 1409.1241946782018,
+            "total_output_tokens": 38106,
+            "total_input_tokens": 76347,
+            "cached_prompt_tokens": 0,
+            "goodput": {
+              "slo_ttft_ms": 2000.0,
+              "slo_tpot_ms": 100.0,
+              "requests_meeting_slo": 65,
+              "pct": 32.5,
+              "requests_per_sec": 1.199694456286208
+            },
+            "latency": {
+              "ttft_ms": {
+                "p50": 5415.060738466082,
+                "p90": 13678.585159066779,
+                "p95": 15169.729003652832,
+                "p99": 15750.507892919457,
+                "mean": 6087.835904428992
+              },
+              "total_latency_ms": {
+                "p50": 19707.209012602332,
+                "p90": 26228.469644097277,
+                "p95": 27250.845786214995,
+                "p99": 28434.67874164409,
+                "mean": 19731.913124709026
+              },
+              "tpot_ms": {
+                "p50": 74.41376326499346,
+                "p90": 77.89155542036833,
+                "p95": 78.87878219521097,
+                "p99": 79.59620322543553,
+                "mean": 72.1339115504448
+              },
+              "itl_ms": {
+                "p50": 57.23321550021865,
+                "p90": 115.02088450015435,
+                "p95": 143.6612709999281,
+                "p99": 181.71067760008555,
+                "mean": 71.98901081770713
+              }
+            },
+            "errors": {},
+            "gpu": {
+              "available": true,
+              "gpu_name": "Tesla T4",
+              "num_samples": 268,
+              "util_mean_pct": 71.65671641791045,
+              "util_p50_pct": 75.0,
+              "util_max_pct": 97.0,
+              "mem_used_max_mb": 12748.1875,
+              "mem_total_mb": 15360.0
+            },
+            "engine": {
+              "interval": "since previous snapshot",
+              "prefix_cache_hit_rate": null,
+              "preemptions_swap": 0,
+              "preemptions_recompute": 0,
+              "spec_acceptance_rate": null,
+              "engine_steps": 808,
+              "avg_batch_size": 47.16089108910891,
+              "avg_tokens_per_step": 141.40222772277227,
+              "avg_kv_utilization": 0.06884009093973943,
+              "gpu_memory": {
+                "allocated_mb": 12033.77783203125,
+                "reserved_mb": 12156.0,
+                "max_allocated_mb": 12111.69140625
+              }
+            }
+          }
+        },
+        {
+          "label": "16/s",
+          "rate": 16,
+          "concurrency": null,
+          "report": {
+            "total_requests": 200,
+            "successful": 200,
+            "failed": 0,
+            "success_rate_pct": 100.0,
+            "test_duration_s": 53.40104234099999,
+            "throughput_requests_per_sec": 3.745245246766372,
+            "throughput_tokens_per_sec": 733.9182585563383,
+            "throughput_input_tokens_per_sec": 1458.6232138056312,
+            "total_output_tokens": 39192,
+            "total_input_tokens": 77892,
+            "cached_prompt_tokens": 0,
+            "goodput": {
+              "slo_ttft_ms": 2000.0,
+              "slo_tpot_ms": 100.0,
+              "requests_meeting_slo": 64,
+              "pct": 32.0,
+              "requests_per_sec": 1.198478478965239
+            },
+            "latency": {
+              "ttft_ms": {
+                "p50": 11534.719218525424,
+                "p90": 24782.479405023194,
+                "p95": 26702.43832077644,
+                "p99": 28169.89238675983,
+                "mean": 11791.104537617093
+              },
+              "total_latency_ms": {
+                "p50": 26783.626054367458,
+                "p90": 37797.81892452292,
+                "p95": 38474.842206323745,
+                "p99": 39975.741483311256,
+                "mean": 26081.549360552075
+              },
+              "tpot_ms": {
+                "p50": 75.83094453042654,
+                "p90": 80.68775237842124,
+                "p95": 81.54934096878364,
+                "p99": 83.62475089552112,
+                "mean": 73.27045725427286
+              },
+              "itl_ms": {
+                "p50": 56.89700100015216,
+                "p90": 111.12691720018121,
+                "p95": 134.77649040009965,
+                "p99": 270.60946610992687,
+                "mean": 73.29936819314209
+              }
+            },
+            "errors": {},
+            "gpu": {
+              "available": true,
+              "gpu_name": "Tesla T4",
+              "num_samples": 263,
+              "util_mean_pct": 72.63878326996198,
+              "util_p50_pct": 75.0,
+              "util_max_pct": 100.0,
+              "mem_used_max_mb": 12808.1875,
+              "mem_total_mb": 15360.0
+            },
+            "engine": {
+              "interval": "since previous snapshot",
+              "prefix_cache_hit_rate": null,
+              "preemptions_swap": 0,
+              "preemptions_recompute": 0,
+              "spec_acceptance_rate": null,
+              "engine_steps": 755,
+              "avg_batch_size": 51.912582781456955,
+              "avg_tokens_per_step": 154.8132450331126,
+              "avg_kv_utilization": 0.07741125846978844,
+              "gpu_memory": {
+                "allocated_mb": 12033.77783203125,
+                "reserved_mb": 12216.0,
+                "max_allocated_mb": 12167.36279296875
+              }
+            }
+          }
+        },
+        {
+          "label": "inf",
+          "rate": Infinity,
+          "concurrency": null,
+          "report": {
+            "total_requests": 200,
+            "successful": 200,
+            "failed": 0,
+            "success_rate_pct": 100.0,
+            "test_duration_s": 53.77348363100009,
+            "throughput_requests_per_sec": 3.71930525037997,
+            "throughput_tokens_per_sec": 708.4160710398728,
+            "throughput_input_tokens_per_sec": 1429.217428563511,
+            "total_output_tokens": 38094,
+            "total_input_tokens": 76854,
+            "cached_prompt_tokens": 0,
+            "goodput": {
+              "slo_ttft_ms": 2000.0,
+              "slo_tpot_ms": 100.0,
+              "requests_meeting_slo": 21,
+              "pct": 10.5,
+              "requests_per_sec": 0.39052705128989684
+            },
+            "latency": {
+              "ttft_ms": {
+                "p50": 18086.322956500226,
+                "p90": 35566.92476520006,
+                "p95": 38262.06079505012,
+                "p99": 41653.96937143035,
+                "mean": 18559.63894683015
+              },
+              "total_latency_ms": {
+                "p50": 33102.78189700012,
+                "p90": 48004.75604020016,
+                "p95": 49562.69107875026,
+                "p99": 51479.55101094005,
+                "mean": 32518.70837294518
+              },
+              "tpot_ms": {
+                "p50": 75.91061020661638,
+                "p90": 83.57781752944531,
+                "p95": 88.3340241038343,
+                "p99": 91.83711906959475,
+                "mean": 73.9002406182501
+              },
+              "itl_ms": {
+                "p50": 58.197145999884015,
+                "p90": 105.41471559990896,
+                "p95": 133.51072890011434,
+                "p99": 215.0684576801723,
+                "mean": 73.67429897142043
+              }
+            },
+            "errors": {},
+            "gpu": {
+              "available": true,
+              "gpu_name": "Tesla T4",
+              "num_samples": 266,
+              "util_mean_pct": 70.57518796992481,
+              "util_p50_pct": 75.0,
+              "util_max_pct": 100.0,
+              "mem_used_max_mb": 12808.1875,
+              "mem_total_mb": 15360.0
+            },
+            "engine": {
+              "interval": "since previous snapshot",
+              "prefix_cache_hit_rate": null,
+              "preemptions_swap": 0,
+              "preemptions_recompute": 0,
+              "spec_acceptance_rate": null,
+              "engine_steps": 748,
+              "avg_batch_size": 50.94385026737968,
+              "avg_tokens_per_step": 153.40641711229947,
+              "avg_kv_utilization": 0.0748735962373409,
+              "gpu_memory": {
+                "allocated_mb": 12033.77783203125,
+                "reserved_mb": 12216.0,
+                "max_allocated_mb": 12167.4248046875
+              }
+            }
+          }
+        }
+      ]
+    },
+    "prefix": {
+      "env": {
+        "MODEL_NAME": "Qwen/Qwen2.5-1.5B-Instruct",
+        "ENABLE_PREFIX_CACHING": "1",
+        "REQUEST_TIMEOUT_MS": "3600000",
+        "MAX_QUEUE_SIZE": "264",
+        "METRICS_OUTPUT_PATH": "results/serving_Tesla-T4_20260927-190748_prefix_metrics.json"
+      },
+      "levels": [
+        {
+          "label": "2/s",
+          "rate": 2,
+          "concurrency": null,
+          "report": {
+            "total_requests": 200,
+            "successful": 200,
+            "failed": 0,
+            "success_rate_pct": 100.0,
+            "test_duration_s": 113.45848293200015,
+            "throughput_requests_per_sec": 1.7627593356758293,
+            "throughput_tokens_per_sec": 337.7887576988808,
+            "throughput_input_tokens_per_sec": 665.9969184083634,
+            "total_output_tokens": 38325,
+            "total_input_tokens": 75563,
+            "cached_prompt_tokens": 0,
+            "goodput": {
+              "slo_ttft_ms": 2000.0,
+              "slo_tpot_ms": 100.0,
+              "requests_meeting_slo": 200,
+              "pct": 100.0,
+              "requests_per_sec": 1.7627593356758293
+            },
+            "latency": {
+              "ttft_ms": {
+                "p50": 111.00814285077831,
+                "p90": 167.2959947973595,
+                "p95": 193.1304258501085,
+                "p99": 251.42063763810702,
+                "mean": 119.01183198099943
+              },
+              "total_latency_ms": {
+                "p50": 9709.481290216218,
+                "p90": 12672.265209477155,
+                "p95": 13151.786051582847,
+                "p99": 13644.21383114194,
+                "mean": 9849.132855626018
+              },
+              "tpot_ms": {
+                "p50": 51.225024188442205,
+                "p90": 54.29872919946907,
+                "p95": 55.22083801906884,
+                "p99": 56.175672533817945,
+                "mean": 50.99934884958475
+              },
+              "itl_ms": {
+                "p50": 45.51344700030313,
+                "p90": 67.17530440009796,
+                "p95": 76.79735179990527,
+                "p99": 104.9946878798619,
+                "mean": 51.043257828957465
+              }
+            },
+            "errors": {},
+            "gpu": {
+              "available": true,
+              "gpu_name": "Tesla T4",
+              "num_samples": 562,
+              "util_mean_pct": 57.59074733096085,
+              "util_p50_pct": 58.0,
+              "util_max_pct": 94.0,
+              "mem_used_max_mb": 12746.1875,
+              "mem_total_mb": 15360.0
+            },
+            "engine": {
+              "interval": "since previous snapshot",
+              "prefix_cache_hit_rate": 0.0,
+              "preemptions_swap": 0,
+              "preemptions_recompute": 0,
+              "spec_acceptance_rate": null,
+              "engine_steps": 2258,
+              "avg_batch_size": 16.972984942426926,
+              "avg_tokens_per_step": 50.348981399468556,
+              "avg_kv_utilization": 0.024614623819551387,
+              "gpu_memory": {
+                "allocated_mb": 12033.77783203125,
+                "reserved_mb": 12154.0,
+                "max_allocated_mb": 12108.349609375
+              }
+            }
+          }
+        },
+        {
+          "label": "4/s",
+          "rate": 4,
+          "concurrency": null,
+          "report": {
+            "total_requests": 200,
+            "successful": 200,
+            "failed": 0,
+            "success_rate_pct": 100.0,
+            "test_duration_s": 64.97375323899996,
+            "throughput_requests_per_sec": 3.0781660290474284,
+            "throughput_tokens_per_sec": 600.534801437008,
+            "throughput_input_tokens_per_sec": 1185.6326002383432,
+            "total_output_tokens": 39019,
+            "total_input_tokens": 77035,
+            "cached_prompt_tokens": 0,
+            "goodput": {
+              "slo_ttft_ms": 2000.0,
+              "slo_tpot_ms": 100.0,
+              "requests_meeting_slo": 200,
+              "pct": 100.0,
+              "requests_per_sec": 3.0781660290474284
+            },
+            "latency": {
+              "ttft_ms": {
+                "p50": 148.2223691607487,
+                "p90": 268.73795550386603,
+                "p95": 935.8708892707664,
+                "p99": 1367.2840429336513,
+                "mean": 224.6004125580339
+              },
+              "total_latency_ms": {
+                "p50": 12468.757735949339,
+                "p90": 15539.656713392515,
+                "p95": 16138.733803459963,
+                "p99": 17797.07730584962,
+                "mean": 12447.474256073003
+              },
+              "tpot_ms": {
+                "p50": 62.31975417093062,
+                "p90": 71.18722832870661,
+                "p95": 72.17847519013682,
+                "p99": 73.50781318744292,
+                "mean": 62.96164725249046
+              },
+              "itl_ms": {
+                "p50": 52.46090800028469,
+                "p90": 95.44848200021083,
+                "p95": 116.8515589996332,
+                "p99": 172.47341063998647,
+                "mean": 62.973666727710516
+              }
+            },
+            "errors": {},
+            "gpu": {
+              "available": true,
+              "gpu_name": "Tesla T4",
+              "num_samples": 321,
+              "util_mean_pct": 68.85981308411215,
+              "util_p50_pct": 72.0,
+              "util_max_pct": 97.0,
+              "mem_used_max_mb": 12746.1875,
+              "mem_total_mb": 15360.0
+            },
+            "engine": {
+              "interval": "since previous snapshot",
+              "prefix_cache_hit_rate": 0.0,
+              "preemptions_swap": 0,
+              "preemptions_recompute": 0,
+              "spec_acceptance_rate": null,
+              "engine_steps": 1094,
+              "avg_batch_size": 35.66636197440585,
+              "avg_tokens_per_step": 105.89945155393053,
+              "avg_kv_utilization": 0.0526153599815474,
+              "gpu_memory": {
+                "allocated_mb": 12033.77783203125,
+                "reserved_mb": 12154.0,
+                "max_allocated_mb": 12108.38818359375
+              }
+            }
+          }
+        },
+        {
+          "label": "8/s",
+          "rate": 8,
+          "concurrency": null,
+          "report": {
+            "total_requests": 200,
+            "successful": 200,
+            "failed": 0,
+            "success_rate_pct": 100.0,
+            "test_duration_s": 54.63354669799992,
+            "throughput_requests_per_sec": 3.6607544647530967,
+            "throughput_tokens_per_sec": 697.4835481694075,
+            "throughput_input_tokens_per_sec": 1397.4381056025234,
+            "total_output_tokens": 38106,
+            "total_input_tokens": 76347,
+            "cached_prompt_tokens": 0,
+            "goodput": {
+              "slo_ttft_ms": 2000.0,
+              "slo_tpot_ms": 100.0,
+              "requests_meeting_slo": 66,
+              "pct": 33.0,
+              "requests_per_sec": 1.2080489733685218
+            },
+            "latency": {
+              "ttft_ms": {
+                "p50": 5116.8195870234285,
+                "p90": 13732.187941959955,
+                "p95": 15362.921690553003,
+                "p99": 16005.945139919753,
+                "mean": 6084.429272098861
+              },
+              "total_latency_ms": {
+                "p50": 19763.005426421616,
+                "p90": 26312.020986084415,
+                "p95": 27356.87672093311,
+                "p99": 28641.88690747194,
+                "mean": 19666.50171518385
+              },
+              "tpot_ms": {
+                "p50": 74.33464861494072,
+                "p90": 79.09801876459177,
+                "p95": 79.67817716974928,
+                "p99": 81.45629448352037,
+                "mean": 71.76658853480143
+              },
+              "itl_ms": {
+                "p50": 55.82586350010388,
+                "p90": 109.66306899990741,
+                "p95": 132.55088725009045,
+                "p99": 195.62632294976078,
+                "mean": 71.6618606188202
+              }
+            },
+            "errors": {},
+            "gpu": {
+              "available": true,
+              "gpu_name": "Tesla T4",
+              "num_samples": 270,
+              "util_mean_pct": 71.21851851851852,
+              "util_p50_pct": 75.0,
+              "util_max_pct": 100.0,
+              "mem_used_max_mb": 12748.1875,
+              "mem_total_mb": 15360.0
+            },
+            "engine": {
+              "interval": "since previous snapshot",
+              "prefix_cache_hit_rate": 0.0,
+              "preemptions_swap": 0,
+              "preemptions_recompute": 0,
+              "spec_acceptance_rate": null,
+              "engine_steps": 818,
+              "avg_batch_size": 46.58435207823961,
+              "avg_tokens_per_step": 139.67359413202934,
+              "avg_kv_utilization": 0.06799852503583034,
+              "gpu_memory": {
+                "allocated_mb": 12033.77783203125,
+                "reserved_mb": 12156.0,
+                "max_allocated_mb": 12117.60009765625
+              }
+            }
+          }
+        },
+        {
+          "label": "16/s",
+          "rate": 16,
+          "concurrency": null,
+          "report": {
+            "total_requests": 200,
+            "successful": 200,
+            "failed": 0,
+            "success_rate_pct": 100.0,
+            "test_duration_s": 55.116980995000176,
+            "throughput_requests_per_sec": 3.62864577104001,
+            "throughput_tokens_per_sec": 711.0694252930003,
+            "throughput_input_tokens_per_sec": 1413.2123819892424,
+            "total_output_tokens": 39192,
+            "total_input_tokens": 77892,
+            "cached_prompt_tokens": 0,
+            "goodput": {
+              "slo_ttft_ms": 2000.0,
+              "slo_tpot_ms": 100.0,
+              "requests_meeting_slo": 64,
+              "pct": 32.0,
+              "requests_per_sec": 1.1611666467328032
+            },
+            "latency": {
+              "ttft_ms": {
+                "p50": 12164.235027015593,
+                "p90": 25528.793494763613,
+                "p95": 27976.314614276493,
+                "p99": 29474.729099999673,
+                "mean": 12449.494925431949
+              },
+              "total_latency_ms": {
+                "p50": 27539.187424867123,
+                "p90": 38319.37916232487,
+                "p95": 39468.543277852245,
+                "p99": 41631.42413888081,
+                "mean": 27068.898423166946
+              },
+              "tpot_ms": {
+                "p50": 78.36820085869574,
+                "p90": 83.5459949713649,
+                "p95": 85.2223438276181,
+                "p99": 86.39098314865653,
+                "mean": 75.07970152739216
+              },
+              "itl_ms": {
+                "p50": 57.68187099988609,
+                "p90": 111.06476569989354,
+                "p95": 135.00356739996278,
+                "p99": 228.49933475998566,
+                "mean": 74.98668187184548
+              }
+            },
+            "errors": {},
+            "gpu": {
+              "available": true,
+              "gpu_name": "Tesla T4",
+              "num_samples": 272,
+              "util_mean_pct": 70.29411764705883,
+              "util_p50_pct": 75.0,
+              "util_max_pct": 100.0,
+              "mem_used_max_mb": 12808.1875,
+              "mem_total_mb": 15360.0
+            },
+            "engine": {
+              "interval": "since previous snapshot",
+              "prefix_cache_hit_rate": 0.0,
+              "preemptions_swap": 0,
+              "preemptions_recompute": 0,
+              "spec_acceptance_rate": null,
+              "engine_steps": 756,
+              "avg_batch_size": 51.84391534391534,
+              "avg_tokens_per_step": 154.60846560846562,
+              "avg_kv_utilization": 0.07730886262525218,
+              "gpu_memory": {
+                "allocated_mb": 12033.77783203125,
+                "reserved_mb": 12216.0,
+                "max_allocated_mb": 12167.36279296875
+              }
+            }
+          }
+        },
+        {
+          "label": "inf",
+          "rate": Infinity,
+          "concurrency": null,
+          "report": {
+            "total_requests": 200,
+            "successful": 200,
+            "failed": 0,
+            "success_rate_pct": 100.0,
+            "test_duration_s": 53.94149362500002,
+            "throughput_requests_per_sec": 3.707720838996325,
+            "throughput_tokens_per_sec": 706.20958820363,
+            "throughput_input_tokens_per_sec": 1424.7658868011179,
+            "total_output_tokens": 38094,
+            "total_input_tokens": 76854,
+            "cached_prompt_tokens": 0,
+            "goodput": {
+              "slo_ttft_ms": 2000.0,
+              "slo_tpot_ms": 100.0,
+              "requests_meeting_slo": 25,
+              "pct": 12.5,
+              "requests_per_sec": 0.4634651048745406
+            },
+            "latency": {
+              "ttft_ms": {
+                "p50": 18072.463877500013,
+                "p90": 35852.88100229995,
+                "p95": 38099.69367405009,
+                "p99": 42080.313697820064,
+                "mean": 18606.41143146009
+              },
+              "total_latency_ms": {
+                "p50": 33439.9246559999,
+                "p90": 48569.5551923,
+                "p95": 50061.96568000002,
+                "p99": 51561.509835350276,
+                "mean": 32728.034737210095
+              },
+              "tpot_ms": {
+                "p50": 77.28626999490808,
+                "p90": 83.14579177877911,
+                "p95": 87.61287082878732,
+                "p99": 92.42444131696891,
+                "mean": 74.78077237096056
+              },
+              "itl_ms": {
+                "p50": 59.91223149999314,
+                "p90": 104.1081411999585,
+                "p95": 129.18059910011834,
+                "p99": 301.258578920092,
+                "mean": 74.53223890721492
+              }
+            },
+            "errors": {},
+            "gpu": {
+              "available": true,
+              "gpu_name": "Tesla T4",
+              "num_samples": 266,
+              "util_mean_pct": 70.45864661654136,
+              "util_p50_pct": 74.0,
+              "util_max_pct": 100.0,
+              "mem_used_max_mb": 12808.1875,
+              "mem_total_mb": 15360.0
+            },
+            "engine": {
+              "interval": "since previous snapshot",
+              "prefix_cache_hit_rate": 0.0,
+              "preemptions_swap": 0,
+              "preemptions_recompute": 0,
+              "spec_acceptance_rate": null,
+              "engine_steps": 747,
+              "avg_batch_size": 51.01070950468541,
+              "avg_tokens_per_step": 153.61178045515396,
+              "avg_kv_utilization": 0.07497131059849294,
+              "gpu_memory": {
+                "allocated_mb": 12033.77783203125,
+                "reserved_mb": 12216.0,
+                "max_allocated_mb": 12167.36279296875
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

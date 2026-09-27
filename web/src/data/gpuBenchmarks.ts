@@ -1,21 +1,21 @@
 /**
  * gpuBenchmarks.ts — Where PageServe v3 has been tested, and what it measured.
  *
- * ┌─ Adding Colab results (one-file edit) ─────────────────────────────────────┐
+ * ┌─ Adding Colab results ─────────────────────────────────────────────────────┐
  * │ 1. Run colab/PageServe_Colab.ipynb on a T4 / L4 / A100 runtime.            │
- * │ 2. Open results/offline_<gpu>_<time>.json: paste its `runs` array into     │
- * │    that platform's `offline.runs` (and `system` into `system`).            │
- * │ 3. Open results/serving_<gpu>_<time>.json: paste its `configs` object into │
- * │    `serving.configs`, and set `serving.workload` to the --workload used.   │
- * │ 4. Set `status: 'verified'` and `date`.                                    │
- * │ The JSON can be pasted as-is: field names below mirror what                │
- * │ benchmarks/bench_offline.py and benchmarks/bench_serving.py write, and    │
- * │ extra keys are allowed. Python's `Infinity` (the "inf" rate) is valid JS. │
+ * │ 2. Copy the .json/.md/.png from its results/ into                          │
+ * │    benchmarks/published/<GPU>_<date>/ (the source of truth).               │
+ * │ 3. python -m benchmarks.export_site_data benchmarks/published/<dir> \      │
+ * │        web/src/data/results/<id>.json                                      │
+ * │ 4. Import that file below and fill the platform entry from it (see t4).    │
+ * │ Field names mirror what bench_offline.py / bench_serving.py write.         │
  * └────────────────────────────────────────────────────────────────────────────┘
  *
  * Rules: never invent numbers. A platform without a metric block renders
  * placeholders; a missing field inside a block renders "–".
  */
+
+import t4Results from './results/t4.json';
 
 type Extra = { [key: string]: unknown };
 
@@ -129,15 +129,30 @@ export interface PlatformEntry {
     /** Extra caveats per `suite/workload` key. */
     notes?: Record<string, string>;
   };
-  serving?: {
-    workload?: string;
-    configs: Record<string, ServingConfig>;
-  };
+  /** One entry per bench_serving.py run (each run is one workload). */
+  serving?: ServingSweep[];
 }
+
+export interface ServingSweep {
+  workload: string;
+  /** Outputs ended at EOS (speculation comparisons) instead of fixed lengths. */
+  natural_stop?: boolean;
+  description?: string;
+  note?: string;
+  source?: string;
+  configs: Record<string, ServingConfig>;
+}
+
+const t4 = t4Results as unknown as {
+  system: SystemInfo;
+  offline: { runs: OfflineRun[] };
+  serving: ServingSweep[];
+};
 
 export const SOFTWARE_TESTED = [
   { transformers: '4.51', torch: '2.6' },
   { transformers: '5.12', torch: '2.12' },
+  { transformers: '5.16', torch: '2.11 + CUDA 12.8' },
 ];
 
 export const PLATFORMS: PlatformEntry[] = [
@@ -204,14 +219,56 @@ export const PLATFORMS: PlatformEntry[] = [
   },
   {
     id: 't4',
-    status: 'pending',
+    status: 'verified',
     gpu: 'NVIDIA T4',
     device: 'cuda',
     where: 'Colab',
     model: 'Qwen/Qwen2.5-1.5B-Instruct',
     dtype: 'fp16',
-    date: null,
-    summary: 'Benchmarks coming. T4 has no bf16, so it runs fp16.',
+    date: '2026-09-27',
+    summary:
+      'Full Colab notebook run on commit f168063. KV pool auto-sized to 9 GB (331k tokens). T4 has no bf16, so it runs fp16.',
+    checks: [
+      'Smoke test: all 6 engine features exact on CUDA',
+      'fp16 accuracy equal to HF (99.7% top-1 vs fp32)',
+      '0 failed requests · 0 preemptions · no server errors',
+      '28× HF sequential throughput (offline)',
+    ],
+    system: t4.system as SystemInfo,
+    offline: {
+      runs: t4.offline.runs as OfflineRun[],
+      workloads: {
+        'batching/random': '128 requests · prompts 256–512 tokens · outputs 128–256 (fixed) · all sent at t=0 · the two one-at-a-time systems run the first 12',
+        'prefix/shared_prefix': '128 requests · 1,024-token shared system prompt + a short unique question · outputs 128–256 (fixed)',
+        'spec/repetitive': '128 copy-a-passage requests · outputs end at EOS',
+        'spec/chat': '128 chat questions · outputs end at EOS',
+      },
+      notes: {
+        'batching/random':
+          'TTFT is high by design here: all 128 requests arrive at once, so later ones queue — see the serving sweep for latency under realistic load. With batching off, the engine is ~9% slower per token than HF (the price of gathering KV through block tables); batching is where it wins.',
+        'spec/repetitive':
+          'Draft-model speculation (Qwen2.5-0.5B drafting for the 1.5B target) is slower on a T4: the draft costs a third of the target and runs k steps per verification. It is meant for large targets, e.g. 7B on an A100.',
+        'spec/chat':
+          'Free-form chat gives n-gram drafts little to copy (27% accepted), so there is no gain. Speculation pays off for copy-heavy output (summaries, RAG, code edits), not as a default.',
+      },
+    },
+    serving: [
+      {
+        ...t4.serving[0],
+        description: '200 requests per load level (24 for the sequential server) · prompts 256–512 tokens · outputs 128–256 (fixed) · Poisson arrivals',
+        note: 'The sequential server tops out at 0.14 req/s, so every request after the first few waits in line (TTFT ≈ 80 s). Continuous batching serves 3.7 req/s and keeps 100% goodput up to 4 req/s. Prefix caching matches plain batching here — this workload has no shared prefixes, so it is a check that the cache costs nothing when it cannot help.',
+      },
+      {
+        ...t4.serving[1],
+        description: '120 requests per load level · 1,024-token shared system prompt + a short question · outputs 128–256 (fixed)',
+        note: 'With the system prompt cached (94% of prompt tokens hit), TTFT p50 at 4 req/s drops from 1,021 ms to 107 ms and goodput goes from 0% to 100%.',
+      },
+      {
+        ...t4.serving[2],
+        description: '120 chat requests per load level · outputs end at EOS · both configs have prefix caching on, so the only difference is speculation',
+        note: 'n-gram drafts are accepted only ~27% of the time on free-form chat: a small TPOT gain at 2 req/s (41.4 vs 43.6 ms), no real gain at higher load.',
+      },
+    ] as ServingSweep[],
   },
   {
     id: 'l4',
@@ -342,11 +399,10 @@ export interface ServingRow {
   gpuMemMb: number | null;
 }
 
-/** Flattens `serving.configs` into one row per config × load level. */
-export function servingRows(entry: PlatformEntry): ServingRow[] {
-  if (!entry.serving) return [];
+/** Flattens a sweep's configs into one row per config × load level. */
+export function servingRows(sweep: ServingSweep): ServingRow[] {
   const rows: ServingRow[] = [];
-  for (const [config, cfg] of Object.entries(entry.serving.configs)) {
+  for (const [config, cfg] of Object.entries(sweep.configs)) {
     for (const level of cfg.levels ?? []) {
       const r = level.report;
       const lat = r.latency;
@@ -382,10 +438,18 @@ export function compareSystems(platformId: string, groupKey: string, from: strin
   return { from: a, to: b, ratio: a && b ? b / a : null };
 }
 
-/** The four headline comparisons from the local v3 smoke run (Apple M2, MPS). */
-export const SMOKE_HIGHLIGHTS = [
-  { label: 'vs HF sequential · 8 concurrent requests', ...compareSystems('m2-mps', 'concurrency/concurrent', 'hf_sequential', 'engine') },
-  { label: 'continuous batching · offline ablation', ...compareSystems('m2-mps', 'batching/random', 'hf_sequential', 'engine') },
-  { label: 'prefix caching · shared-prompt workload', ...compareSystems('m2-mps', 'prefix/shared_prefix', 'engine', 'engine+prefix') },
-  { label: 'n-gram speculation · one request', ...compareSystems('m2-mps', 'spec/single_request', 'engine', 'engine+ngram') },
+/** Peak output throughput (tok/s) of one config across a serving sweep's load levels. */
+export function servingPeak(platformId: string, workload: string, config: string): number | null {
+  const sweep = platform(platformId)?.serving?.find((sw) => sw.workload === workload);
+  const levels = sweep?.configs[config]?.levels ?? [];
+  const values = levels.map((l) => num(l.report.throughput_tokens_per_sec)).filter((v): v is number => v !== null);
+  return values.length ? Math.max(...values) : null;
+}
+
+/** Headline comparisons: NVIDIA T4 (Colab), Qwen2.5-1.5B-Instruct fp16, offline ablation. */
+export const HEADLINE_HIGHLIGHTS = [
+  { label: 'continuous batching vs HF sequential', ...compareSystems('t4', 'batching/random', 'hf_sequential', 'engine') },
+  { label: 'vs HF static batching', ...compareSystems('t4', 'batching/random', 'hf_static_batch', 'engine') },
+  { label: 'prefix caching · shared system prompt', ...compareSystems('t4', 'prefix/shared_prefix', 'engine', 'engine+prefix') },
+  { label: 'n-gram speculation · copy-heavy output', ...compareSystems('t4', 'spec/repetitive', 'engine', 'engine+ngram') },
 ];

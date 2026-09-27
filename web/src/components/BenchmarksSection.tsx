@@ -12,6 +12,7 @@ import {
   type OfflineGroup,
   type PlatformEntry,
   type ServingRow,
+  type ServingSweep,
 } from '@/data/gpuBenchmarks';
 import {
   SINGLE_REQUEST,
@@ -27,7 +28,8 @@ import {
 // ── Formatting ────────────────────────────────────────────────────────────────
 
 const dash = <span className="text-fg-4">–</span>;
-const f1 = (v: number | null) => (v === null ? dash : v >= 1000 ? Math.round(v).toLocaleString() : v.toFixed(1));
+const f1 = (v: number | null) =>
+  v === null ? dash : v >= 1000 ? Math.round(v).toLocaleString() : v < 1 ? v.toFixed(2) : v.toFixed(1);
 const fx = (v: number | null) => (v === null ? dash : `${v.toFixed(2)}×`);
 const fpct = (v: number | null) => (v === null ? dash : `${Math.round(v)}%`);
 
@@ -127,9 +129,16 @@ function OfflineTable({ group }: { group: OfflineGroup }) {
   );
 }
 
-function ServingTable({ rows }: { rows: ServingRow[] }) {
+function ServingTable({ rows, sweep }: { rows: ServingRow[]; sweep: ServingSweep }) {
   return (
     <div className="overflow-hidden rounded-xl border border-line">
+      <div className="flex flex-wrap items-baseline justify-between gap-2 border-b border-line bg-white/[0.015] px-4 py-2.5">
+        <p className="font-mono text-[11px] text-fg-2">
+          <span className="text-fg">workload</span> <span className="text-fg-4">/</span> {sweep.workload}
+          <span className="text-fg-4"> · {sweep.natural_stop ? 'outputs end at EOS' : 'fixed output lengths'}</span>
+        </p>
+        {sweep.description && <p className="text-[12px] text-fg-3">{sweep.description}</p>}
+      </div>
       <Table
         head={SERVING_HEAD}
         minW={1040}
@@ -139,6 +148,12 @@ function ServingTable({ rows }: { rows: ServingRow[] }) {
           fpct(r.goodputPct), fpct(r.gpuUtilPct), f1(r.gpuMemMb),
         ])}
       />
+      {sweep.note && (
+        <p className="border-t border-line bg-amber/[0.05] px-4 py-2.5 text-[12.5px] text-fg-2">
+          <span className="text-amber">Note · </span>
+          {sweep.note}
+        </p>
+      )}
     </div>
   );
 }
@@ -168,10 +183,10 @@ function PlaceholderTable({ head, minW, message }: { head: string[]; minW: numbe
 // ── Platform switcher ─────────────────────────────────────────────────────────
 
 function PlatformResults() {
-  const [id, setId] = useState('m2-mps');
+  const [id, setId] = useState('t4');
   const p: PlatformEntry = PLATFORMS.find((x) => x.id === id) ?? PLATFORMS[0];
   const groups = offlineGroups(p);
-  const serving = servingRows(p);
+  const sweeps = p.serving ?? [];
   const pending = p.status === 'pending';
 
   return (
@@ -232,10 +247,12 @@ function PlatformResults() {
 
         <div>
           <p className="mb-2.5 font-mono text-[10.5px] uppercase tracking-[0.16em] text-fg-3">
-            Serving sweep · bench_serving.py{p.serving?.workload ? ` · workload ${p.serving.workload}` : ''}
+            Serving sweeps · bench_serving.py · streaming · Poisson arrivals · latencies in ms
           </p>
-          {serving.length ? (
-            <ServingTable rows={serving} />
+          {sweeps.length ? (
+            <div className="space-y-4">
+              {sweeps.map((sw) => <ServingTable key={sw.workload} sweep={sw} rows={servingRows(sw)} />)}
+            </div>
           ) : (
             <PlaceholderTable head={SERVING_HEAD} minW={1040} message={pending ? 'benchmarks coming' : 'no serving sweep recorded yet'} />
           )}
@@ -398,7 +415,8 @@ export function BenchmarksSection() {
               Seeded workloads; every result records GPU, versions and git commit. Tables mirror what{' '}
               <code className="font-mono text-[0.9em] text-sky">bench_offline.py</code> and{' '}
               <code className="font-mono text-[0.9em] text-sky">bench_serving.py</code> write. Pending GPUs show empty tables
-              until real Colab runs land.
+              until real Colab runs land. The NVIDIA T4 results come from a full notebook run; the raw files are in{' '}
+              <code className="font-mono text-[0.9em] text-sky">benchmarks/published/</code>.
             </>
           }
         />
@@ -417,8 +435,10 @@ export function BenchmarksSection() {
             ))}
           </div>
           <p className="mt-2 font-mono text-[10.5px] text-fg-4">
-            Latency is measured from the scheduled send time, so a server that falls behind is charged for it. Benchmarks use
-            ignore_eos so every system generates the same number of tokens.
+            Latency is measured from the scheduled send time, so a server that falls behind is charged for it. Batching and
+            prefix-caching runs use ignore_eos so every system generates the same number of tokens; speculative-decoding runs let
+            outputs end at EOS instead (greedy speculation is exact, so every config emits the same text, while forced output
+            past EOS makes models loop and would overstate the gain).
           </p>
         </Reveal>
 
