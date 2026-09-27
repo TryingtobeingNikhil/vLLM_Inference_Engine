@@ -9,3 +9,7 @@ web/node_modules/
 web/.next/
 web/out/
 web/.env*.local
+
+# Benchmark outputs
+results/
+load_test_report.json

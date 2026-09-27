@@ -1,51 +1,47 @@
 """
-engine/scheduler.py — Continuous Batching Scheduler (Phase 2).
+engine/scheduler.py — Continuous Batching Scheduler.
 
 Architecture
 ------------
-The scheduler owns a single background asyncio task (`run_loop`) that runs
-continuously for the lifetime of the server. Blocking model operations are
-dispatched to worker threads so they do not stall the event loop.
+The scheduler owns one background asyncio task (``run_loop``).  Each
+iteration is one *step*:
 
-                       ┌─────────────────────────────────────────┐
-  add_request()  ──►  │  RequestQueue  (Phase 3)               │
-                       └────────────────────┬────────────────────┘
-                                            │  _schedule()
-                                            │   1. evict finished
-                                            │   2. admit new (up to headroom)
-                                            │   3. prefill each new sequence
-                                            │   4. one decode step per running seq
-                                            ▼
-                       ┌─────────────────────────────────────────┐
-                       │  running  (list[Sequence])              │
-                       └────────────────────┬────────────────────┘
-                                            │  state == "finished"
-                                            ▼
-                       ┌─────────────────────────────────────────┐
-                       │  finished  (list[Sequence])             │
-                       └─────────────────────────────────────────┘
+    add_request() ──► RequestQueue (FIFO, timeouts, backpressure)
+                          │
+                          ▼  _schedule()
+    ┌─────────────────────────────────────────────────────────────────────┐
+    │ 1. plan     (event loop, CPU only)                                  │
+    │    a. every running sequence in decode gets 1 token (+k speculative │
+    │       slots); grow its block table, preempting the NEWEST running    │
+    │       sequence (swap to CPU or drop for recompute) if the pool is    │
+    │       exhausted                                                      │
+    │    b. sequences mid-prefill get their next chunk (≤ chunk size),     │
+    │       bounded by the per-step prefill token budget                   │
+    │    c. swapped-out sequences are swapped back in when blocks allow    │
+    │    d. new requests are admitted FCFS while there are free batch      │
+    │       slots, budget and enough KV blocks for their whole prompt —    │
+    │       prefix-cache hits are shared instead of recomputed             │
+    │ 2. execute  (worker thread) — ONE packed forward pass for the whole  │
+    │    plan: prefill chunks and decode tokens together                   │
+    │ 3. apply    (event loop) — append sampled tokens, verify speculative │
+    │    drafts, stream tokens to clients, publish full blocks to the      │
+    │    prefix cache, finish sequences and free their blocks              │
+    └─────────────────────────────────────────────────────────────────────┘
 
-Decode step design (Gap 1 resolution)
---------------------------------------
-`_decode_step` does NOT call Phase 1's `decode()` function, which would run
-the full remaining-token loop and block all other sequences for their entire
-generation.  Instead, it performs a raw single-token model forward pass — the
-same pattern as the inner loop of `decode()` in sequential.py — one step at a
-time.  After each step the scheduler can preempt and serve other sequences.
+Why plan and apply run on the event loop: every piece of scheduler state is
+mutated from exactly one thread, so there are no locks to reason about in
+the scheduling logic.  Only the GPU work runs in the executor thread, and
+the event loop stays free to accept HTTP requests while it runs.
 
-Threading
----------
-Tokenization retains the scheduler's shared executor. Phase 4 prefill and
-decode helpers are blocking functions dispatched with ``asyncio.to_thread``.
-The scheduler awaits each call, so model execution remains serial until true
-tensor-level batching is introduced in Phase 8.
-
-Memory (Gap 3 acknowledgement)
---------------------------------
-Each Sequence holds a separate `past_key_values` object.  For Qwen2-0.5B
-(fp16) this grows by ~3 MB per generated token.  At max_batch_size=4 and
-max_new_tokens=50 this adds ~600 MB on top of the ~950 MB model weight
-footprint.  KV cache eviction and swapping are Phase 9 features.
+Scheduling policy (FCFS with LIFO preemption, as in vLLM)
+---------------------------------------------------------
+* ``running`` is kept in arrival order.  When memory runs out, the most
+  recently arrived running sequence is preempted first, so older requests
+  keep making progress and cannot be starved by a stream of new arrivals.
+* Nothing new is admitted in a step that preempted, or while swapped-out
+  sequences are waiting to come back.
+* Admission requires blocks for the *whole* prompt up front (plus a small
+  watermark), so admitted prefills never stall half-way for lack of memory.
 """
 
 from __future__ import annotations
@@ -55,86 +51,77 @@ import logging
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence as Seq, Tuple
 
 import torch
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 from inference_engine.config import Config
-from inference_engine.engine.attention_wrapper import build_past_key_values, extract_new_token_kv
 from inference_engine.engine.block_allocator import BlockAllocator, OutOfBlocksError
-from inference_engine.engine.cpu_swap_manager import CPUSwapManager, CPUSwapError
+from inference_engine.engine.cpu_swap_manager import CPUSwapError, CPUSwapManager
 from inference_engine.engine.kv_cache_config import (
     compute_kv_cache_config,
     format_kv_cache_report,
 )
 from inference_engine.engine.kv_cache_tracker import KVCacheTracker
 from inference_engine.engine.metrics_aggregator import MetricsAggregator
+from inference_engine.engine.model_runner import (
+    ModelRunner,
+    SequenceInput,
+    determine_num_blocks,
+    resolve_max_model_len,
+)
 from inference_engine.engine.paged_kv_cache import PagedKVCacheManager
-from inference_engine.engine.prefill_utils import run_prefill_single
 from inference_engine.engine.request_queue import RequestQueue
-from inference_engine.engine.sequence import Sequence
-from inference_engine.engine.stage_tracker import StageTracker
+from inference_engine.engine.sequence import SamplingParams, Sequence
 from inference_engine.engine.sequential import GenerationResult, get_memory_stats
+from inference_engine.engine.spec_decode import DraftModelProposer, DraftRequest, NgramProposer
+from inference_engine.engine.stage_tracker import StageTracker
 from inference_engine.metrics.collector import MetricsCollector
+from inference_engine.models.loader import get_eos_token_ids
 
 logger = logging.getLogger(__name__)
 
 
-# ── Compatibility helper ───────────────────────────────────────────────────────
+@dataclass
+class ScheduledItem:
+    """One sequence's share of a step."""
 
-def _extract_kv_layer(
-    past_key_values,
-    layer_idx: int,
-) -> tuple:
-    """Extract (key, value) tensors for one layer from past_key_values.
+    seq: Sequence
+    num_tokens: int                     # uncomputed tokens processed this step
+    num_lookahead: int = 0              # speculative slots reserved
+    draft_tokens: List[int] = field(default_factory=list)
+    is_decode: bool = False
 
-    Handles three formats returned by different transformers versions:
 
-    1. Legacy tuple-of-tuples (transformers < ~4.36):
-       ``past_key_values[layer_idx]`` → ``(key_tensor, value_tensor)``
-       shape: [batch, num_kv_heads, seq_len, head_dim]
+@dataclass
+class StepPlan:
+    items: List[ScheduledItem] = field(default_factory=list)
+    num_preempted: int = 0
 
-    2. DynamicCache with key_cache / value_cache lists (transformers ~4.36-4.40):
-       ``past_key_values.key_cache[layer_idx]`` → key tensor
-       ``past_key_values.value_cache[layer_idx]`` → value tensor
-
-    3. DynamicCache with layers list (transformers >= ~4.41):
-       ``past_key_values.layers[layer_idx].keys`` → key tensor
-       ``past_key_values.layers[layer_idx].values`` → value tensor
-       shape: [batch, num_kv_heads, seq_len, head_dim]
-
-    Returns
-    -------
-    (key_tensor, value_tensor)
-        Both shaped [batch, num_kv_heads, seq_len, head_dim].
-    """
-    # Format 3: DynamicCache with .layers list holding DynamicLayer objects
-    if hasattr(past_key_values, "layers"):
-        layer = past_key_values.layers[layer_idx]
-        return layer.keys, layer.values
-
-    # Format 2: DynamicCache with .key_cache / .value_cache lists
-    if hasattr(past_key_values, "key_cache"):
-        return past_key_values.key_cache[layer_idx], past_key_values.value_cache[layer_idx]
-
-    # Format 1: Legacy tuple-of-tuples
-    layer = past_key_values[layer_idx]
-    return layer[0], layer[1]
+    def remove(self, seq: Sequence) -> None:
+        self.items = [item for item in self.items if item.seq is not seq]
 
 
 class ContinuousBatchingScheduler:
-    """Iteration-level continuous batching scheduler.
+    """Iteration-level continuous batching scheduler over a paged KV cache.
 
     Parameters
     ----------
     model
         A loaded HuggingFace causal LM in eval mode.
     tokenizer
-        The corresponding tokenizer (pad_token already set).
+        The corresponding tokenizer.
     config
-        Engine Config; reads ``max_batch_size`` and ``scheduler_poll_interval_ms``.
+        Engine Config.
+    metrics_collector
+        Optional shared per-request result store.
+    draft_model
+        Small model for ``speculative_method="draft"``.
+    eos_token_ids
+        Override the stop tokens (defaults to generation_config + tokenizer).
     """
 
     def __init__(
@@ -143,74 +130,112 @@ class ContinuousBatchingScheduler:
         tokenizer: PreTrainedTokenizerBase,
         config: Config,
         metrics_collector: Optional[MetricsCollector] = None,
+        draft_model: Optional[PreTrainedModel] = None,
+        eos_token_ids: Optional[List[int]] = None,
     ) -> None:
         self.model = model
         self.tokenizer = tokenizer
         self.config = config
+        self._device: torch.device = next(model.parameters()).device
+        self.eos_token_ids = set(
+            eos_token_ids if eos_token_ids is not None else get_eos_token_ids(model, tokenizer)
+        )
 
+        # ── KV cache sizing ───────────────────────────────────────────────────
         self.kv_cache_config = compute_kv_cache_config(model, config)
-        allocated_mb, _ = get_memory_stats(config.device)
-        available_mb = getattr(config, "kv_cache_max_memory_mb", 1024.0)
-        self.kv_tracker = KVCacheTracker(
-            self.kv_cache_config, max_memory_mb=available_mb
-        )
-        logger.info(
-            "%s\n  Current allocated memory: %.2f MB",
-            format_kv_cache_report(self.kv_cache_config),
-            allocated_mb,
-        )
+        self.max_model_len = resolve_max_model_len(model, config)
+        models = [model]
+        kv_configs = [self.kv_cache_config]
+        self.draft_kv_cache_config = None
+        if config.speculative_method == "draft":
+            if draft_model is None:
+                raise ValueError("speculative_method='draft' requires a draft_model")
+            self.draft_kv_cache_config = compute_kv_cache_config(draft_model, config)
+            models.append(draft_model)
+            kv_configs.append(self.draft_kv_cache_config)
+        num_blocks = determine_num_blocks(models, kv_configs, config, self.max_model_len)
+        block_size = config.kv_block_size
+        if num_blocks * block_size < self.max_model_len:
+            logger.warning(
+                "KV pool holds %d tokens < max_model_len=%d; capping max_model_len",
+                num_blocks * block_size, self.max_model_len,
+            )
+            self.max_model_len = num_blocks * block_size
 
-        # Phase 6: Block allocator
+        # Phase 6: block allocator (+ prefix cache)
         self.block_allocator = BlockAllocator(
-            num_blocks=config.kv_num_blocks,
-            block_size=config.kv_block_size,
+            num_blocks=num_blocks,
+            block_size=block_size,
+            enable_prefix_caching=config.enable_prefix_caching,
         )
-
-        # Phase 7: Paged KV cache tensor pool
+        # Phase 7: the device tensor pool
         self.paged_kv_cache = PagedKVCacheManager(
             kv_cache_config=self.kv_cache_config,
             block_allocator=self.block_allocator,
             config=config,
         )
-        kv_stats = self.paged_kv_cache.stats()
-        print(
-            f"[PagedKVCache] Pool size: {kv_stats['pool_size_mb']:.1f} MB "
-            f"({kv_stats['num_blocks']} blocks \u00d7 {kv_stats['block_size']} tokens)"
-        )
-
+        # Phase 8: the batched model runner
+        self.runner = ModelRunner(model, self.paged_kv_cache, seed=config.seed)
         # Phase 9: CPU staging pool for GPU ⇔ CPU swapping
+        num_cpu_blocks = config.kv_num_cpu_blocks or max(
+            1, int(config.swap_space_gb * 2**30 // self.kv_cache_config.bytes_per_block(block_size))
+        )
         self.cpu_swap_manager = CPUSwapManager(
             kv_cache_config=self.kv_cache_config,
-            block_size=config.kv_block_size,
-            num_cpu_blocks=config.kv_num_cpu_blocks,
+            block_size=block_size,
+            num_cpu_blocks=num_cpu_blocks,
+        )
+        # Phase 5: logical KV accounting
+        self.kv_tracker = KVCacheTracker(
+            self.kv_cache_config, max_memory_mb=self.paged_kv_cache.pool_size_mb()
         )
 
+        # Speculative decoding
+        self.ngram_proposer: Optional[NgramProposer] = None
+        self.draft_proposer: Optional[DraftModelProposer] = None
+        if config.speculative_method == "ngram":
+            self.ngram_proposer = NgramProposer(config.ngram_max, config.ngram_min)
+        elif config.speculative_method == "draft":
+            self.draft_kv_cache = PagedKVCacheManager(
+                kv_cache_config=self.draft_kv_cache_config,
+                block_allocator=self.block_allocator,
+                config=config,
+            )
+            self.draft_proposer = DraftModelProposer(
+                ModelRunner(draft_model, self.draft_kv_cache, seed=config.seed)
+            )
+
+        # ── Scheduling state ──────────────────────────────────────────────────
         self.max_batch_size: int = config.max_batch_size
         self.prefill_budget_tokens: int = config.prefill_budget_tokens
         self.decode_batch_limit: int = config.decode_batch_limit
-        self.stage_tracker = StageTracker(history_size=500)
-        self._futures: dict[str, asyncio.Future] = {}
+        self.prefill_chunk_size: int = config.prefill_chunk_size
+        self.watermark_blocks: int = int(0.01 * num_blocks)
 
-        # Phase 3 request queue — replaces raw asyncio.Queue.
-        # maxsize = 8× batch size gives reasonable queue depth before 503.
-        # request_timeout_ms comes from config (default 30 s).
         self.request_queue: RequestQueue = RequestQueue(
-            maxsize=config.max_batch_size * 8,
-            request_timeout_ms=getattr(config, "request_timeout_ms", 30_000.0),
+            maxsize=config.max_queue_size,
+            request_timeout_ms=config.request_timeout_ms,
         )
-        self.running: List[Sequence] = []      # currently active sequences
-        history_size = max(1, getattr(config, "metrics_history_size", 100))
+        self.running: List[Sequence] = []        # arrival order (FCFS)
+        self.swapped_out: List[Sequence] = []    # KV on CPU, waiting to resume
+        self.preempted: List[Sequence] = []      # KV dropped, waiting to re-prefill
+        history_size = max(1, config.metrics_history_size)
         self.finished: deque[Sequence] = deque(maxlen=history_size)
         self.total_finished: int = 0
-        self.swapped_out: List[Sequence] = []  # Phase 9: sequences swapped to CPU
+        self._futures: Dict[str, asyncio.Future] = {}
+        self._pending_aborts: set[str] = set()
 
-        # Phase 10: Unified metrics aggregator
-        # If no MetricsCollector is provided by the server layer, create a
-        # local one so the aggregator always has something to read from.
+        # Counters
+        self.num_preemptions_swap = 0
+        self.num_preemptions_recompute = 0
+        self.num_spec_draft_tokens = 0
+        self.num_spec_accepted_tokens = 0
+        self.num_spec_steps = 0
+
+        # Metrics
+        self.stage_tracker = StageTracker(history_size=500)
         if metrics_collector is None:
-            metrics_collector = MetricsCollector(
-                history_size=getattr(config, "metrics_history_size", 100)
-            )
+            metrics_collector = MetricsCollector(history_size=history_size)
         self._metrics_collector = metrics_collector
         self.metrics_aggregator = MetricsAggregator(
             metrics_collector=self._metrics_collector,
@@ -222,788 +247,556 @@ class ContinuousBatchingScheduler:
             request_queue=self.request_queue,
             history_window_seconds=60.0,
         )
+        scheduler_history_size = history_size * 10
+        self.batch_size_over_time: deque[Tuple[float, int]] = deque(maxlen=scheduler_history_size)
+        self.scheduler_step_latency_ms: deque[float] = deque(maxlen=scheduler_history_size)
 
         # Control
         self._stop_event: asyncio.Event = asyncio.Event()
         self._loop_task: Optional[asyncio.Task] = None
-
-        # Single shared executor — one warm thread, no per-token spawning.
-        self._executor = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="scheduler_inference"
-        )
-
-        # Metrics
-        # list of (timestamp: float, batch_size: int)
-        scheduler_history_size = history_size * 10
-        self.batch_size_over_time: deque[Tuple[float, int]] = deque(
-            maxlen=scheduler_history_size
-        )
-        # wall-clock duration of each _schedule() call in ms
-        self.scheduler_step_latency_ms: deque[float] = deque(
-            maxlen=scheduler_history_size
-        )
-
-        # Device resolved once from model parameters
-        self._device: torch.device = next(model.parameters()).device
+        # One warm thread for the model (forward passes are serialised) and a
+        # separate one for tokenization so new requests never queue behind a
+        # forward pass just to be tokenized.
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="model_runner")
+        self._tokenizer_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tokenizer")
 
         logger.info(
-            "ContinuousBatchingScheduler init: max_batch_size=%d device=%s",
-            self.max_batch_size,
-            self._device,
+            "%s\n  KV pool: %d blocks × %d tokens = %d tokens (%.1f MB)"
+            "\n  max_model_len=%d max_batch_size=%d prefill_budget=%d chunk=%d"
+            " prefix_caching=%s speculative=%s",
+            format_kv_cache_report(self.kv_cache_config),
+            num_blocks, block_size, num_blocks * block_size,
+            self.paged_kv_cache.pool_size_mb(), self.max_model_len,
+            self.max_batch_size, self.prefill_budget_tokens, self.prefill_chunk_size,
+            config.enable_prefix_caching, config.speculative_method or "off",
         )
 
     # ── Public API ────────────────────────────────────────────────────────────
 
     async def add_request(
-        self, prompt: str, max_new_tokens: int
+        self,
+        prompt: str,
+        max_new_tokens: Optional[int] = None,
+        sampling: Optional[SamplingParams] = None,
+        prompt_token_ids: Optional[List[int]] = None,
+        stream: bool = False,
     ) -> Tuple[Sequence, asyncio.Future]:
-        """Tokenize *prompt*, create a Sequence in state 'waiting', enqueue it.
+        """Tokenize *prompt*, create a waiting Sequence and enqueue it.
 
-        Returns a ``(Sequence, asyncio.Future)`` tuple:
-        - Sequence: the caller's request handle.
-        - asyncio.Future: wired to the request lifecycle; resolved with
-          TimeoutError on expiry, CancelledError on cancellation, or the
-          finished Sequence on success.
+        Returns ``(sequence, future)``.  The future resolves with the finished
+        Sequence, or raises TimeoutError (expired in the queue) /
+        CancelledError (aborted before admission).  With ``stream=True``,
+        ``sequence.stream`` receives lists of new token ids, then ``None``.
 
-        Raises QueueFullError if the RequestQueue is at capacity — propagated
-        to the caller; the server layer converts it to HTTP 503.
-
-        Tokenization runs in the shared executor to avoid blocking the event
-        loop on long prompts.
+        Raises QueueFullError when the queue is at capacity and ValueError for
+        requests that can never be served (empty or too-long prompts).
         """
-        if max_new_tokens < 1:
+        if sampling is None:
+            sampling = SamplingParams(max_new_tokens=max_new_tokens or self.config.max_new_tokens)
+        elif max_new_tokens is not None:
+            sampling.max_new_tokens = max_new_tokens
+        if sampling.max_new_tokens < 1:
             raise ValueError("max_new_tokens must be at least 1")
 
-        loop = asyncio.get_running_loop()
-        prompt_token_ids: List[int] = await loop.run_in_executor(
-            self._executor,
-            lambda: self.tokenizer(prompt, add_special_tokens=True)["input_ids"],
-        )
+        if prompt_token_ids is None:
+            loop = asyncio.get_running_loop()
+            prompt_token_ids = await loop.run_in_executor(
+                self._tokenizer_executor,
+                lambda: self.tokenizer(prompt, add_special_tokens=True)["input_ids"],
+            )
         if not prompt_token_ids:
             raise ValueError("The prompt produced no input tokens")
+        if len(prompt_token_ids) >= self.max_model_len:
+            raise ValueError(
+                f"Prompt has {len(prompt_token_ids)} tokens; the engine's "
+                f"max_model_len is {self.max_model_len}"
+            )
 
-        seq = Sequence.create(
-            prompt=prompt,
-            prompt_token_ids=list(prompt_token_ids),
-            max_new_tokens=max_new_tokens,
-        )
+        seq = Sequence.create(prompt=prompt, prompt_token_ids=prompt_token_ids, sampling=sampling)
+        if stream:
+            seq.stream = asyncio.Queue()
         # QueueFullError propagates to caller — do NOT catch here.
         future = await self.request_queue.enqueue(seq)
         self._futures[seq.seq_id] = future
 
-        def _forget_completed_future(done_future: asyncio.Future) -> None:
+        def _on_done(done_future: asyncio.Future) -> None:
             if self._futures.get(seq.seq_id) is done_future:
                 self._futures.pop(seq.seq_id, None)
+            # Expiry / cancellation happen in the queue: unblock stream readers.
+            if seq.stream is not None:
+                seq.stream.put_nowait(None)
 
-        future.add_done_callback(_forget_completed_future)
-        logger.debug("Enqueued seq_id=%s prompt_len=%d", seq.seq_id, len(prompt_token_ids))
+        future.add_done_callback(_on_done)
         return seq, future
 
-    def _record_first_token(self, seq: Sequence) -> None:
-        """Record the prefill token and finish immediately when appropriate."""
-        self.metrics_aggregator.record_token_generated(1)
-        eos_id = self.tokenizer.eos_token_id
-        if eos_id is not None and seq.generated_token_ids[-1] == eos_id:
-            seq.finish_reason = "eos"
-            seq.state = "finished"
-        elif len(seq.generated_token_ids) >= seq.max_new_tokens:
-            seq.finish_reason = "length"
-            seq.state = "finished"
+    async def abort(self, seq_id: str) -> None:
+        """Stop a request (e.g. its client disconnected) and free its memory."""
+        if await self.request_queue.cancel(seq_id):
+            return
+        self._pending_aborts.add(seq_id)
 
-        if seq.is_finished():
-            seq.past_key_values = None
-            self.kv_tracker.unregister_sequence(seq.seq_id)
+    # ── Step 1: plan ──────────────────────────────────────────────────────────
 
-    def _fail_sequence(self, seq: Sequence, exc: Exception) -> None:
-        """Move a sequence to a terminal error state without killing the loop."""
-        logger.exception("Inference failed for seq_id=%s", seq.seq_id, exc_info=exc)
-        seq.state = "finished"
-        seq.finish_reason = "error"
-        seq.error_message = str(exc)
-        seq.past_key_values = None
+    def _running_limit(self) -> int:
+        return min(self.max_batch_size, self.decode_batch_limit)
+
+    def _lookahead_for(self, seq: Sequence) -> int:
+        """Speculative slots for a decode-phase sequence this step."""
+        if not self.config.speculative_method or not seq.sampling.is_greedy:
+            return 0
+        remaining = seq.max_new_tokens - len(seq.generated_token_ids)
+        room = self.max_model_len - seq.num_tokens()
+        return max(0, min(self.config.num_speculative_tokens, remaining - 1, room))
+
+    def _insert_running(self, seq: Sequence) -> None:
+        """Insert into ``running`` keeping arrival (FCFS) order."""
+        idx = len(self.running)
+        while idx > 0 and self.running[idx - 1].arrival_time > seq.arrival_time:
+            idx -= 1
+        self.running.insert(idx, seq)
+
+    def _preempt(self, seq: Sequence, plan: StepPlan) -> None:
+        """Evict *seq*'s KV blocks: swap them to CPU, or drop them for recompute."""
+        plan.remove(seq)
+        plan.num_preempted += 1
+        self.running.remove(seq)
+        seq.num_preemptions += 1
+        seq.draft_num_computed_tokens = 0
+
+        # Swapping only pays off for sequences whose blocks are fully computed.
+        if self.config.preemption_mode == "swap" and seq.num_uncomputed_tokens() == 1:
+            try:
+                self.cpu_swap_manager.swap_out(
+                    seq.seq_id,
+                    self.block_allocator.get_blocks(seq.seq_id),
+                    self.paged_kv_cache,
+                    self.block_allocator,
+                )
+                seq.state = "swapped"
+                self.swapped_out.append(seq)
+                self.num_preemptions_swap += 1
+                logger.debug("Swapped out seq_id=%s", seq.seq_id)
+                return
+            except CPUSwapError:
+                pass  # CPU pool full → fall back to recompute
+            except Exception:
+                # e.g. CUDA OOM on the copy's temporaries: never orphan the
+                # sequence — recompute is always possible.
+                logger.exception("swap-out failed for seq_id=%s; recomputing", seq.seq_id)
+                self.cpu_swap_manager.discard(seq.seq_id)
+
+        self._demote_to_recompute(seq)
+
+    def _demote_to_recompute(self, seq: Sequence) -> None:
+        """Drop *seq*'s device KV; it will re-prefill (usually from cache)."""
+        self.block_allocator.free(seq.seq_id)
+        self.kv_tracker.unregister_sequence(seq.seq_id)
+        seq.num_computed_tokens = 0
+        seq.draft_num_computed_tokens = 0
+        seq.state = "preempted"
+        idx = len(self.preempted)
+        while idx > 0 and self.preempted[idx - 1].arrival_time > seq.arrival_time:
+            idx -= 1
+        self.preempted.insert(idx, seq)
+        self.num_preemptions_recompute += 1
+        logger.debug("Preempted (recompute) seq_id=%s", seq.seq_id)
+
+    def _reserve(self, seq: Sequence, total_tokens: int, plan: StepPlan) -> bool:
+        """Make *seq*'s block table cover *total_tokens*, preempting newer
+        running sequences if needed.  Returns False if *seq* itself had to be
+        preempted."""
+        while True:
+            try:
+                self.block_allocator.ensure_capacity(seq.seq_id, total_tokens)
+                return True
+            except OutOfBlocksError:
+                victims = [s for s in self.running if s is not seq]
+                if not victims or self.running[-1] is seq:
+                    self._preempt(seq, plan)
+                    return False
+                self._preempt(self.running[-1], plan)
+
+    def _admit(self, seq: Sequence, now: float) -> bool:
+        """Allocate blocks for all of *seq*'s tokens (sharing cached prefixes)."""
+        # The watermark reserves headroom for running sequences to grow; with
+        # nothing running it would only block the one request that fits.
+        watermark = self.watermark_blocks if self.running else 0
+        try:
+            cached = self.block_allocator.allocate_for_tokens(
+                seq.seq_id, seq.all_token_ids(), watermark,
+                # re-admissions after preemption would inflate the hit rate
+                count_stats=not seq.first_scheduled_time,
+            )
+        except OutOfBlocksError:
+            return False
+        if not seq.first_scheduled_time:
+            seq.first_scheduled_time = now
+            seq.num_cached_tokens = cached
+        seq.num_computed_tokens = cached
+        seq.state = "prefill"
+        self.kv_tracker.register_sequence(seq.seq_id, cached)
+        self._insert_running(seq)
+        return True
+
+    async def _plan_step(self) -> StepPlan:
+        plan = StepPlan()
+        budget = self.prefill_budget_tokens
+        now = time.perf_counter()
+
+        # a) Decode-phase sequences: one token each (+ speculative slots).
+        for seq in list(self.running):
+            if seq.state not in ("prefill", "decoding") or seq.num_uncomputed_tokens() != 1:
+                continue
+            if seq not in self.running:          # preempted as a victim above
+                continue
+            # A sequence finishing its prompt has nothing to speculate from yet.
+            k = self._lookahead_for(seq) if seq.generated_token_ids else 0
+            target = seq.num_computed_tokens + 1
+            if k:
+                try:  # speculation is optional: never preempt just for it
+                    self.block_allocator.ensure_capacity(seq.seq_id, target + k)
+                except OutOfBlocksError:
+                    k = 0
+            if not self._reserve(seq, target, plan):
+                continue
+            plan.items.append(ScheduledItem(seq, 1, num_lookahead=k, is_decode=True))
+
+        # b) Sequences mid-prefill continue with their next chunk (FCFS).
+        for seq in list(self.running):
+            if budget <= 0:
+                break
+            if seq not in self.running or seq.num_uncomputed_tokens() <= 1:
+                continue
+            n = min(seq.num_uncomputed_tokens(), self.prefill_chunk_size, budget)
+            if not self._reserve(seq, seq.num_computed_tokens + n, plan):
+                continue
+            plan.items.append(ScheduledItem(seq, n))
+            budget -= n
+
+        # c) Swap sequences back in (oldest first) once memory allows.
+        if not plan.num_preempted:
+            for seq in list(self.swapped_out):
+                if len(self.running) >= self._running_limit():
+                    break
+                record = self.cpu_swap_manager.get_swapped_sequence(seq.seq_id)
+                # Room for its blocks plus the next token (and headroom for
+                # others only if anyone else is running).
+                needed = max(record.original_num_blocks,
+                             self.block_allocator.blocks_needed(seq.num_computed_tokens + 1))
+                if self.running:
+                    needed += self.watermark_blocks
+                free = self.block_allocator.num_free_blocks()
+                if free < needed:
+                    if self.running:
+                        break
+                    # Even an empty pool can't take it back with room to grow
+                    # (a near-max-length sequence): recompute instead of
+                    # waiting forever and blocking every later request.
+                    self.cpu_swap_manager.discard(seq.seq_id)
+                    self.swapped_out.remove(seq)
+                    self.num_preemptions_recompute += 1
+                    self._demote_to_recompute(seq)
+                    continue
+                self.swapped_out.remove(seq)
+                try:
+                    self.cpu_swap_manager.swap_in(seq.seq_id, self.paged_kv_cache, self.block_allocator)
+                except Exception:
+                    logger.exception("swap-in failed for seq_id=%s; recomputing", seq.seq_id)
+                    self.cpu_swap_manager.discard(seq.seq_id)
+                    self._demote_to_recompute(seq)
+                    continue
+                seq.state = "decoding"
+                self._insert_running(seq)
+                if self._reserve(seq, seq.num_computed_tokens + 1, plan):
+                    plan.items.append(ScheduledItem(seq, 1, is_decode=True))
+
+        # d) Admit: recompute-preempted sequences first, then new requests.
+        if not plan.num_preempted and not self.swapped_out:
+            while len(self.running) < self._running_limit() and budget > 0:
+                if self.preempted:
+                    seq = self.preempted[0]
+                    if not self._admit(seq, now):
+                        break
+                    self.preempted.pop(0)
+                else:
+                    queued = await self.request_queue.dequeue()
+                    if queued is None:
+                        break
+                    seq = queued.sequence
+                    if not self._admit(seq, now):
+                        await self.request_queue.requeue_front(queued)
+                        break
+                    self.request_queue.mark_admitted()
+                n = min(seq.num_uncomputed_tokens(), self.prefill_chunk_size, budget)
+                plan.items.append(ScheduledItem(seq, n))
+                budget -= n
+
+        # Speculation: n-gram drafts are cheap CPU work, propose them now.
+        if self.ngram_proposer is not None:
+            for item in plan.items:
+                if item.num_lookahead:
+                    item.draft_tokens = self.ngram_proposer.propose(
+                        item.seq.all_token_ids(), item.num_lookahead
+                    )
+        return plan
+
+    # ── Step 2: execute (worker thread) ───────────────────────────────────────
+
+    def _execute(self, plan: StepPlan) -> Dict[str, List[int]]:
+        if self.draft_proposer is not None:
+            spec_items = [item for item in plan.items if item.num_lookahead]
+            if spec_items:
+                drafts = self.draft_proposer.propose([
+                    DraftRequest(
+                        seq_id=item.seq.seq_id,
+                        token_ids=item.seq.all_token_ids(),
+                        draft_computed=item.seq.draft_num_computed_tokens,
+                        block_table=self.block_allocator.get_blocks(item.seq.seq_id),
+                        k=item.num_lookahead,
+                    )
+                    for item in spec_items
+                ])
+                for item in spec_items:
+                    item.draft_tokens = drafts[item.seq.seq_id]
+
+        inputs: List[SequenceInput] = []
+        for item in plan.items:
+            seq = item.seq
+            start = seq.num_computed_tokens
+            if item.draft_tokens:
+                tokens = [seq.generated_token_ids[-1]] + item.draft_tokens
+                num_logits = len(tokens)
+            else:
+                tokens = seq.all_token_ids()[start:start + item.num_tokens]
+                num_logits = 1 if start + item.num_tokens == seq.num_tokens() else 0
+            inputs.append(SequenceInput(
+                seq_id=seq.seq_id,
+                token_ids=tokens,
+                start_pos=start,
+                block_table=self.block_allocator.get_blocks(seq.seq_id),
+                num_logits=num_logits,
+                sampling=seq.sampling,
+            ))
+        return self.runner.execute(inputs)
+
+    # ── Step 3: apply ─────────────────────────────────────────────────────────
+
+    def _stop_reason(self, seq: Sequence, token_id: int) -> str:
+        sampling = seq.sampling
+        if not sampling.ignore_eos and token_id in self.eos_token_ids:
+            return "eos"
+        if sampling.stop_token_ids and token_id in sampling.stop_token_ids:
+            return "stop"
+        if len(seq.generated_token_ids) >= sampling.max_new_tokens:
+            return "length"
+        if seq.num_tokens() >= self.max_model_len:
+            return "length"
+        return ""
+
+    def _apply(self, plan: StepPlan, outputs: Dict[str, List[int]]) -> None:
+        now = time.perf_counter()
+        for item in plan.items:
+            seq = item.seq
+            if seq.state not in ("prefill", "decoding"):
+                continue
+            sampled = outputs.get(seq.seq_id)
+            before = seq.num_computed_tokens
+
+            if item.draft_tokens:
+                draft = item.draft_tokens
+                accepted = 0
+                while accepted < len(draft) and draft[accepted] == sampled[accepted]:
+                    accepted += 1
+                new_tokens = draft[:accepted] + [sampled[accepted]]
+                seq.num_computed_tokens = before + 1 + accepted
+                seq.num_draft_tokens += len(draft)
+                seq.num_accepted_tokens += accepted
+                self.num_spec_draft_tokens += len(draft)
+                self.num_spec_accepted_tokens += accepted
+                self.num_spec_steps += 1
+                if self.draft_proposer is not None:
+                    seq.draft_num_computed_tokens = (before + 1) + min(accepted, len(draft) - 1)
+            else:
+                seq.num_computed_tokens = before + item.num_tokens
+                new_tokens = sampled[:1] if sampled else []
+
+            emitted: List[int] = []
+            reason = ""
+            for token_id in new_tokens:
+                seq.generated_token_ids.append(token_id)
+                seq.token_times.append(now)
+                if not seq.first_token_time:
+                    seq.first_token_time = now
+                emitted.append(token_id)
+                reason = self._stop_reason(seq, token_id)
+                if reason:
+                    break
+
+            if seq.generated_token_ids:
+                seq.state = "decoding"
+            computed = min(seq.num_computed_tokens, seq.num_tokens())
+            self.block_allocator.set_token_count(seq.seq_id, computed)
+            self.block_allocator.register_computed_blocks(seq.seq_id, seq.all_token_ids(), computed)
+            self.kv_tracker.update_sequence(seq.seq_id, computed)
+            seq.update_kv_stats(computed, self.kv_tracker.sequence_memory_mb(seq.seq_id))
+
+            if emitted:
+                self.metrics_aggregator.record_token_generated(len(emitted))
+                if seq.stream is not None:
+                    seq.stream.put_nowait(emitted)
+            if reason:
+                self._finish(seq, reason)
+
+    def _finish(self, seq: Sequence, reason: str, error: str = "") -> None:
+        """Move *seq* to a terminal state, release its memory, notify waiters."""
+        for pool in (self.running, self.swapped_out, self.preempted):
+            if seq in pool:
+                pool.remove(seq)
+        self.cpu_swap_manager.discard(seq.seq_id)
+        self.block_allocator.free(seq.seq_id)
         self.kv_tracker.unregister_sequence(seq.seq_id)
 
-    # ── Internal: prefill ─────────────────────────────────────────────────────
-
-    def _prefill_sequence(self, seq: Sequence) -> None:
-        """Run the prefill pass for *seq* and transition it to 'decoding'.
-
-        Sets:
-        - seq.past_key_values
-        - seq.generated_token_ids (first token appended)
-        - seq.ttft_ms
-        - seq.first_token_time
-        - seq.queue_wait_time_ms
-        - seq.state = "decoding"
-        """
-        # Record queue wait before blocking
-        prefill_start = time.perf_counter()
-        seq.queue_wait_time_ms = (prefill_start - seq.arrival_time) * 1000.0
-        seq.state = "prefill"
-
-        past_key_values, first_token_id, ttft_ms = run_prefill_single(
-            self.model,
-            seq.prompt_token_ids,
-            self._device,
-        )
-
-        seq.past_key_values = past_key_values
-        seq.ttft_ms = ttft_ms
-        seq.first_token_time = time.perf_counter()
-        seq.generated_token_ids.append(first_token_id)
-        seq.state = "decoding"
-        prompt_token_count = len(seq.prompt_token_ids)
-        self.kv_tracker.register_sequence(seq.seq_id, prompt_token_count)
-        seq.update_kv_stats(
-            token_count=prompt_token_count,
-            memory_mb=self.kv_tracker.sequence_memory_mb(seq.seq_id),
-        )
-
-        # Phase 6: allocate KV cache blocks for the prompt
-        import math
-        blocks_needed = math.ceil(prompt_token_count / self.config.kv_block_size)
-        try:
-            block_ids = self.block_allocator.allocate(seq.seq_id, blocks_needed)
-            self.block_allocator.set_token_count(seq.seq_id, prompt_token_count)
-        except OutOfBlocksError:
-            # Phase 9: instead of killing the sequence, try to swap out the
-            # largest running sequence to free device blocks, then retry.
-            swapped_ok = self._try_swap_out_victim()
-            if not swapped_ok:
-                seq.state = "finished"
-                seq.finish_reason = "oom"
-                seq.past_key_values = None
-                self.kv_tracker.unregister_sequence(seq.seq_id)
-                return
-            # Retry allocation once after swap-out freed some blocks
-            try:
-                block_ids = self.block_allocator.allocate(seq.seq_id, blocks_needed)
-                self.block_allocator.set_token_count(seq.seq_id, prompt_token_count)
-            except OutOfBlocksError:
-                seq.state = "finished"
-                seq.finish_reason = "oom"
-                seq.past_key_values = None
-                self.kv_tracker.unregister_sequence(seq.seq_id)
-                return
-
-        # Phase 7: write prompt KV tensors into paged pool
-        # HuggingFace past_key_values may be a tuple-of-tuples (legacy) or
-        # DynamicCache (transformers >= 4.38). Use the compat helper.
-        past_kv = seq.past_key_values
-        seq_len = len(seq.prompt_token_ids)
-        for layer_idx in range(self.kv_cache_config.num_layers):
-            layer_key, layer_val = _extract_kv_layer(past_kv, layer_idx)
-            # shape: [1, num_kv_heads, seq_len, head_dim]
-            for token_position in range(seq_len):
-                key_slice = layer_key[0, :, token_position, :]
-                val_slice = layer_val[0, :, token_position, :]
-                self.paged_kv_cache.write_kv(
-                    seq.seq_id, layer_idx, token_position, key_slice, val_slice
-                )
-        # Phase 8: release HuggingFace KV tensor — pool is now source of truth
-        seq.past_key_values = None
-        self._record_first_token(seq)
-
-        logger.debug(
-            "Prefill done: seq_id=%s ttft=%.1f ms first_token=%d",
-            seq.seq_id,
-            ttft_ms,
-            first_token_id,
-        )
-
-    # ── Internal: chunked prefill ──────────────────────────────────────────────
-
-    def _prefill_chunk_blocking(self, seq: Sequence) -> None:
-        """Run ONE chunk of the prefill pass for *seq*.
-
-        This is the core of the chunked-prefill feature.  Instead of processing
-        the full prompt in a single blocking forward pass (which delays decode
-        for all other sequences), we advance by at most ``seq.prefill_chunk_size``
-        tokens per scheduler step, then yield back to the event loop so other
-        sequences can decode.
-
-        Chunk logic
-        -----------
-        - First chunk  (seq.prefill_offset == 0): cold forward pass, no prior KV.
-        - Middle chunks: reconstruct accumulated KV from the paged pool, then
-          run a forward pass over the next slice of prompt tokens.
-        - Final chunk  (offset+chunk reaches end of prompt): same as middle, but
-          additionally samples the first output token and transitions to decoding.
-
-        After each chunk:
-        - New KV tensors are written into the paged pool.
-        - Block-allocator token accounting is updated.
-        - ``seq.prefill_offset`` is advanced.
-
-        This is a BLOCKING function intended to run inside the shared executor.
-        """
-        import math
-
-        t_chunk_start = time.perf_counter()
-
-        prompt_ids = seq.prompt_token_ids
-        prompt_len = len(prompt_ids)
-        chunk_start = seq.prefill_offset
-        chunk_end = min(chunk_start + seq.prefill_chunk_size, prompt_len)
-        chunk_ids = prompt_ids[chunk_start:chunk_end]
-        chunk_len = len(chunk_ids)
-        is_first_chunk = chunk_start == 0
-        is_last_chunk = chunk_end >= prompt_len
-
-        # ── Record queue wait and start time on the first chunk ───────────────
-        if is_first_chunk:
-            seq.queue_wait_time_ms = (t_chunk_start - seq.arrival_time) * 1000.0
-            seq.prefill_start_time = t_chunk_start
-            seq.state = "chunked_prefilling"
-
-            # Allocate blocks for the full prompt upfront (same as full prefill)
-            blocks_needed = math.ceil(prompt_len / self.config.kv_block_size)
-            try:
-                block_ids = self.block_allocator.allocate(seq.seq_id, blocks_needed)
-                self.block_allocator.set_token_count(seq.seq_id, 0)
-            except OutOfBlocksError:
-                swapped_ok = self._try_swap_out_victim()
-                if not swapped_ok:
-                    seq.state = "finished"
-                    seq.finish_reason = "oom"
-                    return
-                try:
-                    block_ids = self.block_allocator.allocate(seq.seq_id, blocks_needed)
-                    self.block_allocator.set_token_count(seq.seq_id, 0)
-                except OutOfBlocksError:
-                    seq.state = "finished"
-                    seq.finish_reason = "oom"
-                    return
-
-            # Register with KV tracker using prompt length
-            self.kv_tracker.register_sequence(seq.seq_id, 0)
-
-        # ── Build past_key_values from paged pool (empty on first chunk) ──────
-        if is_first_chunk:
-            past_kv = None
-        else:
-            past_kv = build_past_key_values(
-                seq_id=seq.seq_id,
-                paged_kv_cache=self.paged_kv_cache,
-                num_layers=self.kv_cache_config.num_layers,
-                device=str(self._device),
-                use_dynamic_cache=True,
-            )
-
-        # ── Forward pass over this chunk ──────────────────────────────────────
-        input_ids = torch.tensor([chunk_ids], dtype=torch.long, device=self._device)
-        with torch.no_grad():
-            outputs = self.model(
-                input_ids=input_ids,
-                past_key_values=past_kv,
-                use_cache=True,
-            )
-
-        new_past_kv = outputs.past_key_values
-
-        # ── Write new chunk KV into paged pool ────────────────────────────────
-        # token_position is the global index within the full prompt.
-        for token_pos_in_chunk in range(chunk_len):
-            global_pos = chunk_start + token_pos_in_chunk
-            for layer_idx in range(self.kv_cache_config.num_layers):
-                layer_key, layer_val = _extract_kv_layer(new_past_kv, layer_idx)
-                # layer_key shape: [1, num_kv_heads, total_tokens_so_far, head_dim]
-                # We need the column corresponding to this specific prompt token.
-                # The output KV spans [prior_kv_len .. prior_kv_len + chunk_len].
-                # token_pos_in_chunk maps to that column.
-                # Model outputs contain the prior cache followed by this chunk;
-                # address the newly appended suffix, not the cache prefix.
-                source_position = token_pos_in_chunk - chunk_len
-                key_slice = layer_key[0, :, source_position, :]
-                val_slice = layer_val[0, :, source_position, :]
-                self.paged_kv_cache.write_kv(
-                    seq.seq_id, layer_idx, global_pos, key_slice, val_slice
-                )
-
-        # ── Advance offset ────────────────────────────────────────────────────
-        seq.prefill_offset = chunk_end
-        self.block_allocator.set_token_count(seq.seq_id, chunk_end)
-        self.kv_tracker.update_sequence(seq.seq_id, chunk_end)
-        seq.update_kv_stats(
-            token_count=chunk_end,
-            memory_mb=self.kv_tracker.sequence_memory_mb(seq.seq_id),
-        )
-
-        # ── If this was the last chunk, sample first token & transition ───────
-        if is_last_chunk:
-            logits = outputs.logits       # [1, chunk_len, vocab_size]
-            first_token_id = int(logits[:, -1, :].argmax(dim=-1).item())
-            seq.generated_token_ids.append(first_token_id)
-
-            seq.ttft_ms = (time.perf_counter() - seq.prefill_start_time) * 1000.0
-            seq.first_token_time = time.perf_counter()
-            seq.state = "decoding"
-            self._record_first_token(seq)
-            logger.debug(
-                "Chunked prefill done: seq_id=%s chunks=%d ttft=%.1f ms first_token=%d",
-                seq.seq_id,
-                math.ceil(prompt_len / seq.prefill_chunk_size),
-                seq.ttft_ms,
-                first_token_id,
-            )
-        else:
-            logger.debug(
-                "Chunk %d-%d / %d done for seq_id=%s (%.1f ms)",
-                chunk_start,
-                chunk_end - 1,
-                prompt_len - 1,
-                seq.seq_id,
-                (time.perf_counter() - t_chunk_start) * 1000.0,
-            )
-
-    # ── Internal: single decode step ──────────────────────────────────────────
-
-    def _decode_one_step_blocking(self, seq: Sequence) -> None:
-        """Run ONE raw model forward pass for *seq*.
-
-        This is the inner loop of sequential.py's decode() extracted to run
-        exactly once.  Bypasses decode() entirely — that function would block
-        for the full remaining-token loop.
-
-        Updates seq.past_key_values, appends the new token, records latency,
-        and sets finish state if EOS or max_new_tokens is reached.
-
-        This is a BLOCKING function intended to run inside the shared executor.
-        """
-        self._decode_step_single(seq)
-
-    def _decode_step_single(self, seq: Sequence) -> None:
-        """Run one blocking decode step — uses live past_key_values on the sequence.
-
-        Performance design
-        ------------------
-        We keep ``seq.past_key_values`` alive between steps (the HuggingFace
-        KV cache object returned by the previous forward pass).  This avoids
-        reconstructing the full cache from the paged pool on every token, which
-        is prohibitively expensive on MPS due to Metal dispatch overhead for
-        the many small tensor operations involved (24 layers × read + permute +
-        cache.update = ~240 ms overhead per token on MPS vs ~24 ms for the
-        forward pass itself).
-
-        The paged pool is still updated every step so eviction/swapping (Phase 9)
-        remains accurate — we just never *read* from it during normal decode.
-        When a sequence is swapped out and later swapped back in, its
-        ``past_key_values`` is rebuilt from the pool at that point (handled by
-        the swap-in path in ``_schedule``).
-        """
-        t_step = time.perf_counter()
-
-        # Use the live KV cache kept on the sequence (None only on first decode
-        # step after chunked prefill, which sets state="decoding" but leaves
-        # past_key_values=None — in that case we rebuild once from the pool).
-        past_kv = seq.past_key_values
-        if past_kv is None:
-            past_kv = build_past_key_values(
-                seq_id=seq.seq_id,
-                paged_kv_cache=self.paged_kv_cache,
-                num_layers=self.kv_cache_config.num_layers,
-                device=str(self._device),
-                use_dynamic_cache=True,
-            )
-
-        # The decode input token is the newest generated token.  Reconstruct
-        # the existing cache first, then reserve its new slot so an unwritten
-        # slot is never included in past_key_values.
-        token_position = len(seq.prompt_token_ids) + len(seq.generated_token_ids) - 1
-        try:
-            self.block_allocator.write_token(seq.seq_id, count=1)
-        except OutOfBlocksError:
-            swapped_ok = self._try_swap_out_victim(exclude_seq_id=seq.seq_id)
-            if swapped_ok:
-                try:
-                    self.block_allocator.write_token(seq.seq_id, count=1)
-                except OutOfBlocksError:
-                    swapped_ok = False
-            if not swapped_ok:
-                seq.state = "finished"
-                seq.finish_reason = "oom"
-                seq.past_key_values = None
-                self.kv_tracker.unregister_sequence(seq.seq_id)
-                return
-
-        # Determine next input token
-        last_token_id = (
-            seq.generated_token_ids[-1]
-            if seq.generated_token_ids
-            else seq.prompt_token_ids[-1]
-        )
-        input_ids = torch.tensor(
-            [[last_token_id]], dtype=torch.long, device=self._device
-        )
-
-        # Forward pass — one token with live KV cache
-        with torch.no_grad():
-            outputs = self.model(
-                input_ids=input_ids,
-                past_key_values=past_kv,
-                use_cache=True,
-            )
-
-        # Greedy sample
-        next_token_id = int(outputs.logits[:, -1, :].argmax(dim=-1).item())
-        seq.generated_token_ids.append(next_token_id)
-
-        # Keep the live KV cache on the sequence for the next step
-        seq.past_key_values = outputs.past_key_values
-
-        # Also write the new token's KV into the paged pool so eviction/swap
-        # tracking remains accurate even though we don't read from it here.
-        new_past_kv = outputs.past_key_values
-        for layer_idx in range(self.kv_cache_config.num_layers):
-            key_slice, value_slice = extract_new_token_kv(
-                new_past_kv, layer_idx, token_position
-            )
-            self.paged_kv_cache.write_kv(
-                seq.seq_id, layer_idx, token_position, key_slice, value_slice
-            )
-
-        # Update KV tracker
-        cached_tokens = token_position + 1
-        self.kv_tracker.update_sequence(seq.seq_id, cached_tokens)
-        seq.update_kv_stats(
-            token_count=cached_tokens,
-            memory_mb=self.kv_tracker.sequence_memory_mb(seq.seq_id),
-        )
-
-        # Phase 10: record token throughput for aggregated metrics
-        self.metrics_aggregator.record_token_generated(1)
-
-        # Record per-token latency
-        step_ms = (time.perf_counter() - t_step) * 1000.0
-        seq.per_token_latencies_ms.append(step_ms)
-
-        # Check termination
-        eos_id = self.tokenizer.eos_token_id
-        eos_hit = eos_id is not None and next_token_id == eos_id
-        length_hit = len(seq.generated_token_ids) >= seq.max_new_tokens
-
-        if eos_hit:
-            seq.finish_reason = "eos"
-            seq.state = "finished"
-            # Free live KV memory immediately on completion
-            seq.past_key_values = None
-            logger.debug("seq_id=%s finished (eos)", seq.seq_id)
-        elif length_hit:
-            seq.finish_reason = "length"
-            seq.state = "finished"
-            # Free live KV memory immediately on completion
-            seq.past_key_values = None
-            logger.debug("seq_id=%s finished (length)", seq.seq_id)
-
-        if seq.is_finished():
-            self.kv_tracker.unregister_sequence(seq.seq_id)
-
-    async def _decode_step(self) -> None:
-        """Run one decode step for every sequence in self.running.
-
-        Sequences are decoded serially within the shared executor (one warm
-        thread).  This is the Phase 2 constraint: true tensor-level batching
-        across sequences is deferred to Phase 8.
-
-        The iteration-level scheduling value is still demonstrated: at every
-        call to _schedule(), all running sequences advance by exactly one token
-        before any one sequence monopolises future steps.
-        """
-        if not self.running:
-            return
-
-        loop = asyncio.get_event_loop()
-        for seq in list(self.running):   # snapshot — finished ones removed later
-            if seq.state != "decoding":
-                continue
-            await loop.run_in_executor(
-                self._executor,
-                self._decode_step_single,
-                seq,
-            )
-
-    def _resolve_sequence_future(self, seq: Sequence) -> None:
-        """Resolve the lifecycle future associated with a finished sequence."""
-        seq.finish_time = seq.finish_time or time.perf_counter()
+        seq.state = "finished"
+        seq.finish_reason = reason
+        seq.error_message = error
+        seq.finish_time = time.perf_counter()
+        self.finished.append(seq)
         self.total_finished += 1
-        total_latency_ms = (seq.finish_time - seq.arrival_time) * 1000.0
-        generated_tokens = len(seq.generated_token_ids)
+        self._record_result(seq)
+        self.metrics_aggregator.record_request_finished(reason)
+
         future = self._futures.pop(seq.seq_id, None)
         if future is not None and not future.done():
             future.set_result(seq)
+        elif seq.stream is not None:
+            seq.stream.put_nowait(None)
 
+    def _fail_sequence(self, seq: Sequence, exc: Exception) -> None:
+        """Move a sequence to a terminal error state without killing the loop."""
+        logger.error("Inference failed for seq_id=%s: %s", seq.seq_id, exc)
+        self._finish(seq, "error", str(exc))
+
+    def _record_result(self, seq: Sequence) -> None:
         try:
-            allocated_mb, reserved_mb = get_memory_stats(str(self._device))
+            allocated_mb, reserved_mb = get_memory_stats(self._device.type)
+            total_latency_ms = seq.e2e_latency_ms
+            n_gen = len(seq.generated_token_ids)
             self._metrics_collector.append(
                 GenerationResult(
                     prompt=seq.prompt,
-                    generated_text=self.tokenizer.decode(
-                        seq.generated_token_ids, skip_special_tokens=True
-                    ),
+                    generated_text="",   # decoded lazily by the server; keeps the loop fast
                     prompt_tokens=len(seq.prompt_token_ids),
-                    generated_tokens=generated_tokens,
+                    generated_tokens=n_gen,
                     ttft_ms=seq.ttft_ms,
                     total_latency_ms=total_latency_ms,
-                    tokens_per_second=(
-                        generated_tokens / total_latency_ms * 1000.0
-                        if total_latency_ms > 0 else 0.0
-                    ),
-                    per_token_latencies_ms=list(seq.per_token_latencies_ms),
+                    tokens_per_second=(n_gen / total_latency_ms * 1000.0) if total_latency_ms > 0 else 0.0,
+                    per_token_latencies_ms=seq.itl_ms,
                     gpu_memory_allocated_mb=allocated_mb,
                     gpu_memory_reserved_mb=reserved_mb,
                     timestamp=datetime.now(timezone.utc).isoformat(),
+                    finish_reason=seq.finish_reason,
+                    queue_wait_time_ms=seq.queue_wait_time_ms,
+                    tpot_ms=seq.tpot_ms,
+                    cached_prompt_tokens=seq.num_cached_tokens,
+                    num_preemptions=seq.num_preemptions,
+                    spec_draft_tokens=seq.num_draft_tokens,
+                    spec_accepted_tokens=seq.num_accepted_tokens,
                 )
             )
         except Exception:
             logger.exception("Failed to record metrics for seq_id=%s", seq.seq_id)
 
-        # Phase 10: record completion for throughput and SLO tracking
-        self.metrics_aggregator.record_request_finished(seq.finish_reason)
-        # Phase 7: zero paged pool slots before releasing blocks
-        try:
-            self.paged_kv_cache.clear_sequence(seq.seq_id)
-        except Exception:
-            logger.exception("Failed to clear KV cache for seq_id=%s", seq.seq_id)
-        finally:
-            # Phase 6: release block allocator memory for this sequence
-            self.block_allocator.free(seq.seq_id)
+    def _process_aborts(self) -> None:
+        if not self._pending_aborts:
+            return
+        for pool in (self.running, self.swapped_out, self.preempted):
+            for seq in list(pool):
+                if seq.seq_id in self._pending_aborts or seq.abort_requested:
+                    self._finish(seq, "abort")
+        self._pending_aborts.clear()
 
-    # ── Internal: Phase 9 swap helpers ────────────────────────────────────────
-
-    def _try_swap_out_victim(self, exclude_seq_id: Optional[str] = None) -> bool:
-        """Find the largest running sequence and swap its KV blocks to CPU.
-
-        Selection policy: largest by block count (most device memory freed per
-        swap) rather than LRU.  Freeing one large sequence is more efficient
-        than several small ones.
-
-        Returns
-        -------
-        bool
-            True if a victim was successfully swapped out; False if no
-            candidates exist or the CPU pool is full.
-        """
-        candidates = [
-            sequence
-            for sequence in self.running
-            if sequence.state == "decoding"
-            and sequence.seq_id != exclude_seq_id
-            and self.block_allocator.num_blocks_for_seq(sequence.seq_id) > 0
-        ]
-        if not candidates:
-            return False
-
-        # Pick the sequence holding the most device blocks
-        victim = max(
-            candidates,
-            key=lambda s: self.block_allocator.num_blocks_for_seq(s.seq_id),
-        )
-
-        device_block_ids = self.block_allocator.get_blocks(victim.seq_id)
-        if not device_block_ids:
-            # Nothing to swap — sequence holds no blocks yet
-            return False
-
-        try:
-            self.cpu_swap_manager.swap_out(
-                victim.seq_id,
-                device_block_ids,
-                self.paged_kv_cache,
-                self.block_allocator,
-            )
-        except CPUSwapError:
-            return False
-
-        # Transition victim to 'swapped' state and move it out of running
-        victim.past_key_values = None
-        victim.state = "swapped"
-        self.running.remove(victim)
-        self.swapped_out.append(victim)
-        logger.debug(
-            "Swapped out seq_id=%s (%d blocks) to CPU",
-            victim.seq_id,
-            len(device_block_ids),
-        )
-        return True
-
-    # ── Internal: scheduler step ──────────────────────────────────────────────
+    # ── Scheduler step ────────────────────────────────────────────────────────
 
     async def _schedule(self) -> None:
-        """Run prefill admission, chunked-prefill advancement, then one decode pass.
-
-        Scheduling order per step
-        -------------------------
-        0. Swap-in: restore any sequences whose KV blocks were evicted to CPU.
-        1. Admit: pull new sequences from the waiting queue into self.running,
-           stamping their prefill_chunk_size and setting state to
-           "chunked_prefilling".  No forward pass happens here.
-        2. Chunked prefill: for each "chunked_prefilling" sequence, run exactly
-           one chunk (≤ prefill_chunk_size tokens) via _prefill_chunk_blocking.
-           This is bounded by the prefill_budget_tokens cap so a very long
-           prompt cannot monopolise an entire step.  When the last chunk
-           finishes the sequence transitions to "decoding" automatically.
-        3. Decode: advance every "decoding" sequence by one token.
-        4. Eviction: move finished sequences out of self.running.
-
-        Why this order matters
-        ----------------------
-        By separating admission (Step 1) from the forward pass (Step 2), a
-        newly-admitted sequence sits in self.running immediately but only
-        processes chunk_size tokens before decode runs.  This bounds the
-        maximum delay experienced by already-decoding sequences to the cost of
-        one chunk forward pass rather than the full prompt forward pass.
-        """
+        """Run one step: plan → one batched forward pass → apply."""
         step_start = time.perf_counter()
-        running_limit = min(self.max_batch_size, self.decode_batch_limit)
-
-        # Timeouts must progress even while the active batch is full.
         await self.request_queue.expire_timed_out()
+        self._process_aborts()
 
-        # --- Phase 9: Swap-in check ---
-        # Before admitting new sequences, try to restore any swapped-out
-        # sequences if the device pool now has enough room.
-        for victim in list(self.swapped_out):
-            if len(self.running) >= running_limit:
-                break
-            swap_record = self.cpu_swap_manager.get_swapped_sequence(victim.seq_id)
-            if swap_record is None:
-                # Already cleaned up — remove from list
-                self.swapped_out.remove(victim)
-                continue
-            if self.block_allocator.num_free_blocks() >= swap_record.original_num_blocks:
-                try:
-                    self.cpu_swap_manager.swap_in(
-                        victim.seq_id,
-                        self.paged_kv_cache,
-                        self.block_allocator,
-                    )
-                    victim.state = "decoding"
-                    self.swapped_out.remove(victim)
-                    self.running.append(victim)
-                    logger.debug(
-                        "Swapped in seq_id=%s back to decoding", victim.seq_id
-                    )
-                except OutOfBlocksError:
-                    continue  # still not enough room, try next iteration
+        plan = await self._plan_step()
+        if not plan.items:
+            await asyncio.sleep(self.config.scheduler_poll_interval_ms / 1000.0)
+            return
 
-        # --- Stage 1: Admit new sequences (no prefill forward pass here) ---
-        # Sequences are added to self.running with state "chunked_prefilling".
-        # The actual forward pass happens in Stage 2 below.
-        admit_start = time.perf_counter()
-        sequences_admitted = 0
+        forward_start = time.perf_counter()
+        loop = asyncio.get_running_loop()
+        try:
+            outputs = await loop.run_in_executor(self._executor, self._execute, plan)
+        except Exception as exc:  # keep serving other requests
+            logger.exception("Model execution failed; failing %d sequences", len(plan.items))
+            for item in plan.items:
+                if not item.seq.is_finished():
+                    self._fail_sequence(item.seq, exc)
+            return
+        forward_ms = (time.perf_counter() - forward_start) * 1000.0
+        self._apply(plan, outputs)
 
-        while len(self.running) < running_limit:
-            queued = await self.request_queue.dequeue()
-            if queued is None:
-                break
-            seq = queued.sequence
-            # Stamp the chunk size from config (frozen for this sequence's lifetime)
-            seq.prefill_chunk_size = min(
-                self.config.prefill_chunk_size, self.prefill_budget_tokens
-            )
-            seq.state = "chunked_prefilling"
-            self.running.append(seq)
-            self.request_queue.mark_admitted()
-            sequences_admitted += 1
-
-        # --- Stage 2: Advance chunked prefill for in-progress sequences ---
-        prefill_start = time.perf_counter()
-        tokens_this_iteration = 0
-        sequences_prefilled = 0   # counts sequences that finished their last chunk
-
-        for seq in list(self.running):
-            if seq.state != "chunked_prefilling":
-                continue
-            # Respect the per-step token budget to avoid starving decode.
-            chunk_tokens = min(seq.prefill_chunk_size, len(seq.prompt_token_ids) - seq.prefill_offset)
-            if tokens_this_iteration + chunk_tokens > self.prefill_budget_tokens:
-                # Budget exhausted — this sequence will get its chunk next step.
-                break
-            offset_before = seq.prefill_offset
-            try:
-                await asyncio.to_thread(self._prefill_chunk_blocking, seq)
-                tokens_this_iteration += seq.prefill_offset - offset_before
-            except Exception as exc:
-                self._fail_sequence(seq, exc)
-            if seq.is_prefill_done() and seq.generated_token_ids:
-                sequences_prefilled += 1  # last chunk completed
-            elif seq.state == "finished":
-                # OOM during chunk allocation — will be evicted in Stage 3
-                pass
-
-        prefill_latency_ms = (time.perf_counter() - prefill_start) * 1000.0
+        # ── Telemetry ─────────────────────────────────────────────────────────
+        decode_items = [item for item in plan.items if item.is_decode]
+        prefill_items = [item for item in plan.items if not item.is_decode]
+        prefill_tokens = sum(item.num_tokens for item in prefill_items)
+        num_tokens = prefill_tokens + sum(1 + len(item.draft_tokens) for item in decode_items)
         self.stage_tracker.record_prefill(
-            sequences_prefilled=sequences_prefilled,
-            tokens_prefilled=tokens_this_iteration,
-            latency_ms=prefill_latency_ms,
+            sequences_prefilled=sum(1 for item in prefill_items if item.seq.generated_token_ids),
+            tokens_prefilled=prefill_tokens,
+            latency_ms=forward_ms,
             budget_tokens=self.prefill_budget_tokens,
         )
-
-        # --- Stage 3: Decode + eviction ---
-        decode_start = time.perf_counter()
-        sequences_decoded = 0
-        still_running: List[Sequence] = []
-        for seq in list(self.running):
-            if seq.state == "swapped":
-                continue
-            if seq.state == "decoding":
-                generated_before = len(seq.generated_token_ids)
-                try:
-                    await asyncio.to_thread(self._decode_step_single, seq)
-                    if len(seq.generated_token_ids) > generated_before:
-                        sequences_decoded += 1
-                except Exception as exc:
-                    self._fail_sequence(seq, exc)
-            if seq.state == "swapped":
-                continue
-            if not seq.is_finished():
-                still_running.append(seq)
-            else:
-                self.finished.append(seq)
-                self._resolve_sequence_future(seq)
-        self.running = still_running
-
-        decode_latency_ms = (time.perf_counter() - decode_start) * 1000.0
         self.stage_tracker.record_decode(
-            sequences_decoded=sequences_decoded,
-            latency_ms=decode_latency_ms,
+            sequences_decoded=len(decode_items),
+            latency_ms=forward_ms,
             batch_limit=self.decode_batch_limit,
         )
-
-        step_latency_ms = (time.perf_counter() - step_start) * 1000.0
-        self.scheduler_step_latency_ms.append(step_latency_ms)
+        step_ms = (time.perf_counter() - step_start) * 1000.0
+        num_blocks = self.block_allocator.num_blocks
+        self.metrics_aggregator.record_step(
+            num_seqs=len(plan.items),
+            num_tokens=num_tokens,
+            num_prefill_tokens=prefill_tokens,
+            num_decode_seqs=len(decode_items),
+            num_preempted=plan.num_preempted,
+            kv_utilization=self.block_allocator.num_used_blocks() / num_blocks,
+            forward_ms=forward_ms,
+            step_ms=step_ms,
+        )
+        self.scheduler_step_latency_ms.append(step_ms)
         self.batch_size_over_time.append((time.perf_counter(), len(self.running)))
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
-    async def run_loop(self) -> None:
-        """Main scheduler loop — runs as a background asyncio Task.
+    def has_work(self) -> bool:
+        return bool(
+            self.running or self.swapped_out or self.preempted or len(self.request_queue)
+        )
 
-        Idle sleep interval is ``scheduler_poll_interval_ms / 1000`` seconds
-        (default 0.001 s = 1 ms) when both the waiting queue and running list
-        are empty.
-        """
+    async def run_loop(self) -> None:
+        """Main scheduler loop — runs as a background asyncio Task."""
         idle_sleep_s = self.config.scheduler_poll_interval_ms / 1000.0
         logger.info("Scheduler run_loop started (idle_sleep=%.3f s)", idle_sleep_s)
-
         while not self._stop_event.is_set():
-            if (
-                not self.running
-                and not self.swapped_out
-                and len(self.request_queue) == 0
-            ):
+            if not self.has_work():
+                self._process_aborts()
                 await asyncio.sleep(idle_sleep_s)
                 continue
-            await self._schedule()
-
+            try:
+                await self._schedule()
+            except Exception:
+                logger.exception("Scheduler step failed")
+                await asyncio.sleep(idle_sleep_s)
         logger.info("Scheduler run_loop stopped.")
 
     def start(self) -> None:
-        """Schedule run_loop() as a background asyncio Task.
-
-        Must be called from within a running event loop (e.g. inside a FastAPI
-        lifespan context).
-        """
+        """Schedule run_loop() as a background asyncio Task (needs a running loop)."""
         if self._stop_event.is_set():
             raise RuntimeError("A stopped scheduler cannot be restarted")
         if self._loop_task is not None and not self._loop_task.done():
@@ -1015,9 +808,9 @@ class ContinuousBatchingScheduler:
         self._stop_event.set()
         if self._loop_task is not None:
             try:
-                await asyncio.wait_for(self._loop_task, timeout=5.0)
+                await asyncio.wait_for(self._loop_task, timeout=10.0)
             except asyncio.TimeoutError:
-                logger.warning("Scheduler loop did not stop within 5 s; cancelling.")
+                logger.warning("Scheduler loop did not stop within 10 s; cancelling.")
                 self._loop_task.cancel()
                 try:
                     await self._loop_task
@@ -1028,25 +821,60 @@ class ContinuousBatchingScheduler:
                 future.cancel()
         self._futures.clear()
         self._executor.shutdown(wait=False)
+        self._tokenizer_executor.shutdown(wait=False)
         logger.info("Scheduler stopped. Finished %d sequences.", self.total_finished)
 
-    # ── Public metrics API (Phase 10) ─────────────────────────────────────────
+    # ── Metrics ───────────────────────────────────────────────────────────────
+
+    def spec_decode_stats(self) -> dict:
+        drafted = self.num_spec_draft_tokens
+        steps = self.num_spec_steps
+        return {
+            "method": self.config.speculative_method or "off",
+            "num_speculative_tokens": self.config.num_speculative_tokens,
+            "draft_tokens": drafted,
+            "accepted_tokens": self.num_spec_accepted_tokens,
+            "acceptance_rate": self.num_spec_accepted_tokens / drafted if drafted else 0.0,
+            # tokens emitted per verification step (1.0 = no gain)
+            "mean_tokens_per_step": (
+                (self.num_spec_accepted_tokens + steps) / steps if steps else 0.0
+            ),
+        }
 
     def get_metrics(self) -> dict:
-        """Return a single unified metrics dict via MetricsAggregator.
-
-        This is the ONLY method the server layer should call for metrics.
-        All tracker stats, derived throughput, SLO compliance, and latency
-        percentiles are assembled inside MetricsAggregator.full_report().
-        """
+        """Return a single unified metrics dict via MetricsAggregator."""
         report = self.metrics_aggregator.full_report(
-            requests_in_flight=len(self.running) + len(self.swapped_out),
+            requests_in_flight=len(self.running) + len(self.swapped_out) + len(self.preempted),
             requests_waiting=len(self.request_queue),
         )
         report["summary"] = self._metrics_collector.compute_summary()
+        report["engine"] = {
+            "model": getattr(self.model.config, "_name_or_path", ""),
+            "device": str(self._device),
+            "dtype": str(self.kv_cache_config.dtype),
+            "max_model_len": self.max_model_len,
+            "max_batch_size": self.max_batch_size,
+            "prefill_budget_tokens": self.prefill_budget_tokens,
+            "prefill_chunk_size": self.prefill_chunk_size,
+            "num_running": len(self.running),
+            "num_swapped": len(self.swapped_out),
+            "num_preempted_waiting": len(self.preempted),
+            "preemptions_swap": self.num_preemptions_swap,
+            "preemptions_recompute": self.num_preemptions_recompute,
+            "kv_blocks_total": self.block_allocator.num_blocks,
+            "kv_blocks_used": self.block_allocator.num_used_blocks(),
+            "prefix_cache_hit_rate": self.block_allocator.prefix_cache_hit_rate(),
+        }
+        report["speculative_decoding"] = self.spec_decode_stats()
+        if self._device.type == "cuda":
+            report["gpu_memory"] = {
+                "allocated_mb": torch.cuda.memory_allocated() / 2**20,
+                "reserved_mb": torch.cuda.memory_reserved() / 2**20,
+                "max_allocated_mb": torch.cuda.max_memory_allocated() / 2**20,
+            }
         report["scheduler"] = {
-            "batch_size_over_time": list(self.batch_size_over_time),
-            "scheduler_step_latency_ms": list(self.scheduler_step_latency_ms),
+            "batch_size_over_time": list(self.batch_size_over_time)[-500:],
+            "scheduler_step_latency_ms": list(self.scheduler_step_latency_ms)[-500:],
         }
         report["sequences"] = [
             {
@@ -1055,9 +883,12 @@ class ContinuousBatchingScheduler:
                 "finish_reason": seq.finish_reason,
                 "prompt_tokens": len(seq.prompt_token_ids),
                 "generated_tokens": len(seq.generated_token_ids),
+                "cached_prompt_tokens": seq.num_cached_tokens,
                 "ttft_ms": seq.ttft_ms,
+                "tpot_ms": seq.tpot_ms,
                 "queue_wait_time_ms": seq.queue_wait_time_ms,
+                "num_preemptions": seq.num_preemptions,
             }
-            for seq in self.finished
+            for seq in list(self.finished)[-100:]
         ]
         return report

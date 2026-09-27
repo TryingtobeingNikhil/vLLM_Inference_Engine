@@ -36,25 +36,10 @@ from inference_engine.engine.sequence import Sequence
 
 
 def make_sequence(seq_id: str | None = None) -> Sequence:
-    """Construct a minimal Sequence without a tokenizer or Sequence.create().
-
-    Uses __new__ + manual field assignment so we can run tests without loading
-    any model or tokenizer.
-    """
-    s = Sequence.__new__(Sequence)
-    s.seq_id = seq_id or uuid.uuid4().hex
-    s.prompt = "test"
-    s.prompt_token_ids = [1, 2, 3]
-    s.generated_token_ids = []
-    s.max_new_tokens = 10
-    s.state = "waiting"
-    s.past_key_values = None
-    s.ttft_ms = 0.0
-    s.arrival_time = time.perf_counter()
-    s.first_token_time = 0.0
-    s.per_token_latencies_ms = []
-    s.finish_reason = ""
-    s.queue_wait_time_ms = 0.0
+    """Construct a minimal waiting Sequence without a tokenizer."""
+    s = Sequence.create(prompt="test", prompt_token_ids=[1, 2, 3], max_new_tokens=10)
+    if seq_id is not None:
+        s.seq_id = seq_id
     return s
 
 
@@ -165,8 +150,7 @@ async def test_cancel_removes_from_queue():
         f"Expected state='cancelled', got '{seq_a.state}'"
     )
     assert future_a.done(), "Future must be resolved after cancellation"
-    with pytest.raises(asyncio.CancelledError):
-        future_a.result()
+    assert future_a.cancelled(), "Cancellation must cancel the future"
 
     # seq_b must still be in the queue
     remaining = await queue.dequeue()
@@ -240,3 +224,21 @@ async def test_dequeue_returns_none_on_empty_queue():
 
     result = await queue.dequeue()
     assert result is None, f"Expected None from empty queue, got {result}"
+
+
+@pytest.mark.asyncio
+async def test_requeue_front_restores_head():
+    """A request the scheduler could not admit goes back to the front."""
+    queue = RequestQueue(maxsize=10)
+    first = make_sequence("first")
+    second = make_sequence("second")
+    await queue.enqueue(first)
+    await queue.enqueue(second)
+
+    item = await queue.dequeue()
+    assert item.sequence is first
+    await queue.requeue_front(item)
+
+    assert len(queue) == 2
+    again = await queue.dequeue()
+    assert again.sequence is first

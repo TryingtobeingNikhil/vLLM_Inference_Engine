@@ -4,16 +4,24 @@ load_test/profiles.py — Phase 11: Load pattern generators.
 Pure functions — no I/O, no network, deterministic for a given seed
 (except request_id which uses uuid4, acceptable randomness).
 
-Three profiles:
+Profiles:
   constant_load  — even spacing at a fixed requests-per-second rate
   ramp_load      — linearly increasing rate from start_rps to end_rps
   burst_load     — groups of simultaneous requests at fixed intervals
+  poisson_load   — exponential inter-arrival gaps (memoryless traffic, the
+                   standard model for independent users; seeded)
+
+``schedule_workload`` combines any arrival process with a workload from
+``load_test.workloads`` (per-request prompts and output lengths).
 """
 
 from __future__ import annotations
 
+import math
+import random
 import uuid
 from dataclasses import dataclass
+from typing import List, Sequence
 
 
 # ── LoadRequest ───────────────────────────────────────────────────────────────
@@ -246,4 +254,48 @@ def default_prompt_pool() -> list[str]:
         "Compare and contrast the advantages and disadvantages of "
         "relational databases versus NoSQL document stores, "
         "giving concrete examples of use cases for each.",
+    ]
+
+
+def poisson_arrivals(num_requests: int, requests_per_second: float, seed: int = 0) -> List[float]:
+    """Send times (s) with exponentially distributed gaps.  ``inf`` rate → all at t=0."""
+    if num_requests < 0:
+        raise ValueError("num_requests must be non-negative")
+    if requests_per_second <= 0:
+        raise ValueError("requests_per_second must be greater than zero")
+    if math.isinf(requests_per_second):
+        return [0.0] * num_requests
+    rng = random.Random(seed)
+    t, times = 0.0, []
+    for _ in range(num_requests):
+        times.append(t)
+        t += rng.expovariate(requests_per_second)
+    return times
+
+
+def poisson_load(
+    num_requests: int,
+    requests_per_second: float,
+    prompts: list[str],
+    max_new_tokens: int = 50,
+    seed: int = 0,
+) -> list[LoadRequest]:
+    """Poisson arrivals cycling through *prompts*."""
+    if num_requests and not prompts:
+        raise ValueError("prompts must not be empty")
+    if max_new_tokens <= 0:
+        raise ValueError("max_new_tokens must be greater than zero")
+    return [
+        LoadRequest(uuid.uuid4().hex, prompts[i % len(prompts)], max_new_tokens, t)
+        for i, t in enumerate(poisson_arrivals(num_requests, requests_per_second, seed))
+    ]
+
+
+def schedule_workload(items: Sequence, send_times: Sequence[float]) -> list[LoadRequest]:
+    """Pair workload items (``.prompt``, ``.max_new_tokens``) with send times."""
+    if len(items) != len(send_times):
+        raise ValueError("items and send_times must have the same length")
+    return [
+        LoadRequest(uuid.uuid4().hex, item.prompt, item.max_new_tokens, t)
+        for item, t in zip(items, send_times)
     ]

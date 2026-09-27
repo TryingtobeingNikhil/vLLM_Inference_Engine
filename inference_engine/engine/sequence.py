@@ -1,148 +1,187 @@
 """
-engine/sequence.py — Sequence state dataclass for the Phase 2 continuous
-batching scheduler.
+engine/sequence.py — Per-request state for the continuous batching scheduler.
 
 Each request submitted to the scheduler is wrapped in a Sequence object that
 carries all mutable state through its lifetime:
 
+    waiting ──► prefill ──► decoding ──► finished
+       │           │            │
+       │           └────────────┴──► swapped    (KV blocks copied to CPU;
+       │                                          resumes in "decoding")
+       │           └────────────┴──► preempted  (KV blocks dropped; resumes
+       │                                          by re-prefilling)
+       ├──► expired    (timed out in the queue)
+       └──► cancelled  (client went away before admission)
 
-    waiting   →  prefill   →  decoding   →  finished
-       ↑ created    ↑ admitted    ↑ first token    ↑ EOS or max_new_tokens
+The one number that drives scheduling
+-------------------------------------
+``num_computed_tokens`` counts how many of the sequence's tokens
+(prompt + generated) already have their K/V in the paged cache.  Every step a
+sequence processes some of its *uncomputed* tokens:
 
-    waiting   →  chunked_prefilling  →  decoding   →  finished
-       ↑ created    ↑ admitted (chunked)   ↑ all chunks done
+* prefill          — many uncomputed prompt tokens (processed in chunks)
+* decode           — exactly one uncomputed token: the last sampled one
+* after preemption — every token is uncomputed again (recompute)
 
-    waiting   →  expired    (timed out in queue before prefill)
-    waiting   →  cancelled  (explicit cancel before prefill)
-    decoding  →  swapped    (KV blocks evicted to CPU under memory pressure;
-                             re-enters decoding after swap-in)
-
-    Full valid states in lifecycle order:
-        waiting | prefill | chunked_prefilling | decoding | finished | expired | cancelled | swapped
-
-The `past_key_values` field holds the per-sequence HuggingFace KV cache.
-Storing KV caches per-sequence is the Phase 2 approach; unified KV cache
-management (with eviction/swapping) is Phase 9.
-
-Memory note: for Qwen2-0.5B (fp16) each sequence's KV cache grows by
-approximately 3 MB per generated token.  At max_batch_size=4 and
-max_new_tokens=50 this adds ~600 MB on top of the ~950 MB model weight
-footprint.  Keep max_batch_size ≤ 4 and max_new_tokens ≤ 50 unless you have
-confirmed available headroom.
+When a step processes the final uncomputed token, the logits at that position
+predict the next token.  Prefill, chunked prefill, decode and recompute are
+therefore the *same* operation with different token counts, which is what lets
+one batched forward pass mix them freely.
 """
 
 from __future__ import annotations
 
+import asyncio
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, List
+from typing import List, Optional
+
+
+@dataclass
+class SamplingParams:
+    """Per-request generation controls.
+
+    ``temperature == 0`` means greedy decoding (the default, and the only
+    mode speculative decoding applies to).  ``ignore_eos`` keeps generating
+    until ``max_new_tokens`` — benchmarks use it to fix output lengths.
+    """
+
+    max_new_tokens: int = 50
+    temperature: float = 0.0
+    top_p: float = 1.0
+    top_k: int = -1
+    ignore_eos: bool = False
+    stop_token_ids: Optional[List[int]] = None
+
+    def __post_init__(self) -> None:
+        if self.max_new_tokens < 1:
+            raise ValueError("max_new_tokens must be at least 1")
+        if self.temperature < 0:
+            raise ValueError("temperature must be >= 0")
+        if not 0.0 < self.top_p <= 1.0:
+            raise ValueError("top_p must be in (0, 1]")
+
+    @property
+    def is_greedy(self) -> bool:
+        return self.temperature == 0.0
 
 
 @dataclass
 class Sequence:
     """Full mutable state for one scheduled generation request.
 
-    Fields
-    ------
-    seq_id
-        UUID4 hex string — unique identifier for this sequence.
-    prompt
-        Raw text of the user prompt.
-    prompt_token_ids
-        Token-id list produced by the tokenizer for `prompt`.
-    generated_token_ids
-        Token ids produced so far, including the first token from prefill.
-        Grows by one per scheduler decode step.
-    max_new_tokens
-        Upper bound on tokens to generate.
-    state
-        Lifecycle state.  Mutated exclusively by the scheduler or
-        RequestQueue:
+    Timing fields are ``time.perf_counter()`` timestamps; derived latencies
+    are exposed as properties so they are always consistent with each other:
 
-        Normal path:   ``"waiting"`` → ``"prefill"`` → ``"decoding"`` → ``"finished"``
-        Chunked path:  ``"waiting"`` → ``"chunked_prefilling"`` → ``"decoding"`` → ``"finished"``
-        Timeout path:  ``"waiting"`` → ``"expired"``
-        Cancel path:   ``"waiting"`` → ``"cancelled"``
-        Swap path:     ``"decoding"`` → ``"swapped"`` → ``"decoding"``
-
-        All valid states:
-            ``waiting | prefill | chunked_prefilling | decoding | finished | expired | cancelled | swapped``
-    past_key_values
-        HuggingFace KV cache returned by the last model forward pass.
-        ``None`` until prefill completes.
-    ttft_ms
-        Time-to-first-token in milliseconds.  Set at the end of prefill.
-    arrival_time
-        ``time.perf_counter()`` timestamp when the Sequence was created.
-        Used to compute ``queue_wait_time_ms``.
-    first_token_time
-        ``time.perf_counter()`` timestamp when the first generated token was
-        appended (i.e. at the end of prefill).  ``0.0`` until then.
-    per_token_latencies_ms
-        Wall-clock latency (ms) for each individual decode step.
-        Does **not** include the prefill step; that is captured in ``ttft_ms``.
-    finish_reason
-        ``"length"``  — stopped because ``len(generated_token_ids) >= max_new_tokens``
-        ``"eos"``     — stopped because EOS token was produced
-        ``""``        — not yet finished
-    queue_wait_time_ms
-        Time (ms) from ``arrival_time`` to the moment prefill began.
-        Set by the scheduler when the sequence is admitted from the waiting
-        queue.  ``0.0`` until then.
-    prefill_offset
-        Number of prompt tokens already processed in chunked-prefill mode.
-        Starts at 0; advances by ``prefill_chunk_size`` each step; once it
-        reaches ``len(prompt_token_ids)`` the sequence transitions to
-        ``"decoding"``.  Unused in the legacy full-prefill path.
-    prefill_chunk_size
-        Tokens to process per scheduler step during chunked prefill.
-        Frozen at admission time from ``config.prefill_chunk_size``.
-    prefill_start_time
-        ``time.perf_counter()`` when the first chunk began.  Used to compute
-        TTFT across potentially multiple chunks.  ``0.0`` until the first
-        chunk starts.
+    * ``ttft_ms``            arrival → first generated token (includes queueing)
+    * ``queue_wait_time_ms`` arrival → first scheduled
+    * ``itl_ms``             gaps between consecutive token emissions
+    * ``per_token_latencies_ms`` alias of ``itl_ms`` (kept for API stability)
     """
 
     seq_id: str
     prompt: str
     prompt_token_ids: List[int]
-    generated_token_ids: List[int]
-    max_new_tokens: int
-    state: str  # waiting | prefill | chunked_prefilling | decoding | finished | expired | cancelled | swapped
-    past_key_values: Any              # HuggingFace KV cache; None until prefill done
-    ttft_ms: float
-    arrival_time: float
-    first_token_time: float
-    per_token_latencies_ms: List[float]
-    finish_reason: str                # "length" | "eos" | ""
-    queue_wait_time_ms: float         # arrival → prefill start; set by scheduler
+    sampling: SamplingParams
+    generated_token_ids: List[int] = field(default_factory=list)
+    state: str = "waiting"   # waiting | prefill | decoding | swapped | preempted | finished | expired | cancelled
+    finish_reason: str = ""  # "length" | "eos" | "stop" | "abort" | "oom" | "error"
+    error_message: str = ""
+
+    # ── Cache bookkeeping ─────────────────────────────────────────────────────
+    num_computed_tokens: int = 0
+    num_cached_tokens: int = 0        # prompt tokens served from the prefix cache
+    num_preemptions: int = 0
+    # Speculative decoding
+    draft_num_computed_tokens: int = 0  # draft-model KV progress
+    num_draft_tokens: int = 0           # proposed
+    num_accepted_tokens: int = 0        # accepted by the target model
+
+    # ── Timing ────────────────────────────────────────────────────────────────
+    arrival_time: float = field(default_factory=time.perf_counter)
+    first_scheduled_time: float = 0.0
+    first_token_time: float = 0.0
+    finish_time: float = 0.0
+    token_times: List[float] = field(default_factory=list)
+
+    # KV tracker snapshot (informational)
     kv_token_count: int = 0
     kv_memory_mb: float = 0.0
-    prefill_offset: int = 0           # tokens processed so far (chunked prefill)
-    prefill_chunk_size: int = 128     # frozen at admission from config
-    prefill_start_time: float = 0.0   # perf_counter() when first chunk started
-    finish_time: float = 0.0          # perf_counter() when terminal state was reached
-    error_message: str = ""           # internal failure detail, if any
+
+    # Streaming: the scheduler pushes lists of new token ids, then None.
+    stream: Optional[asyncio.Queue] = None
+    abort_requested: bool = False
 
     # ── Convenience helpers ───────────────────────────────────────────────────
 
-    def is_finished(self) -> bool:
-        """Return True when the sequence has reached terminal state."""
-        return self.state == "finished"
+    @property
+    def max_new_tokens(self) -> int:
+        return self.sampling.max_new_tokens
 
-    def is_prefill_done(self) -> bool:
-        """Return True when all prompt tokens have been processed in chunked prefill."""
-        return self.prefill_offset >= len(self.prompt_token_ids)
-
-    def total_tokens(self) -> int:
+    def num_tokens(self) -> int:
         """Total token count: prompt tokens + generated tokens so far."""
         return len(self.prompt_token_ids) + len(self.generated_token_ids)
+
+    total_tokens = num_tokens  # backwards-compatible name
+
+    def all_token_ids(self) -> List[int]:
+        return self.prompt_token_ids + self.generated_token_ids
+
+    def num_uncomputed_tokens(self) -> int:
+        return self.num_tokens() - self.num_computed_tokens
+
+    def is_prefill_done(self) -> bool:
+        """True once only the last sampled token (if any) lacks KV."""
+        return self.num_uncomputed_tokens() <= 1 and bool(self.generated_token_ids)
+
+    def is_finished(self) -> bool:
+        """Return True when the sequence has reached a terminal state."""
+        return self.state in ("finished", "expired", "cancelled")
 
     def update_kv_stats(self, token_count: int, memory_mb: float) -> None:
         """Update the informational snapshot of this sequence's KV cache."""
         self.kv_token_count = token_count
         self.kv_memory_mb = memory_mb
+
+    # ── Derived latency metrics ───────────────────────────────────────────────
+
+    @property
+    def ttft_ms(self) -> float:
+        if not self.first_token_time:
+            return 0.0
+        return (self.first_token_time - self.arrival_time) * 1000.0
+
+    @property
+    def queue_wait_time_ms(self) -> float:
+        if not self.first_scheduled_time:
+            return 0.0
+        return (self.first_scheduled_time - self.arrival_time) * 1000.0
+
+    @property
+    def itl_ms(self) -> List[float]:
+        """Gaps between token *emissions*.  A speculative step emits several
+        tokens at once; those count as one emission (as a streaming client
+        sees them), so ITL never contains artificial zero gaps."""
+        times = self.token_times
+        return [(b - a) * 1000.0 for a, b in zip(times, times[1:]) if b > a]
+
+    @property
+    def per_token_latencies_ms(self) -> List[float]:
+        return self.itl_ms
+
+    @property
+    def e2e_latency_ms(self) -> float:
+        end = self.finish_time or time.perf_counter()
+        return (end - self.arrival_time) * 1000.0
+
+    @property
+    def tpot_ms(self) -> float:
+        """Mean time per output token after the first one."""
+        n = len(self.generated_token_ids)
+        if n < 2 or not self.first_token_time or not self.token_times:
+            return 0.0
+        return (self.token_times[-1] - self.first_token_time) * 1000.0 / (n - 1)
 
     # ── Factory ───────────────────────────────────────────────────────────────
 
@@ -151,30 +190,17 @@ class Sequence:
         cls,
         prompt: str,
         prompt_token_ids: List[int],
-        max_new_tokens: int,
+        max_new_tokens: Optional[int] = None,
+        sampling: Optional[SamplingParams] = None,
     ) -> "Sequence":
-        """Create a new Sequence in the ``'waiting'`` state.
-
-        Assigns a fresh UUID4, records the current time as ``arrival_time``,
-        and initialises all mutable fields to empty / zero.
-        """
+        """Create a new Sequence in the ``'waiting'`` state."""
+        if sampling is None:
+            sampling = SamplingParams(max_new_tokens=max_new_tokens or 50)
+        elif max_new_tokens is not None:
+            sampling.max_new_tokens = max_new_tokens
         return cls(
             seq_id=uuid.uuid4().hex,
             prompt=prompt,
-            prompt_token_ids=prompt_token_ids,
-            generated_token_ids=[],
-            max_new_tokens=max_new_tokens,
-            state="waiting",
-            past_key_values=None,
-            ttft_ms=0.0,
-            arrival_time=time.perf_counter(),
-            first_token_time=0.0,
-            per_token_latencies_ms=[],
-            finish_reason="",
-            queue_wait_time_ms=0.0,
-            prefill_offset=0,
-            prefill_chunk_size=128,   # overwritten by scheduler at admission
-            prefill_start_time=0.0,
-            finish_time=0.0,
-            error_message="",
+            prompt_token_ids=list(prompt_token_ids),
+            sampling=sampling,
         )

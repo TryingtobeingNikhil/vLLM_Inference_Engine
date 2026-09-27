@@ -3,8 +3,10 @@ load_test/report.py — Phase 11: Result aggregation and report generation.
 
 Takes a list of RequestResult objects from the runner and computes:
 - Success/failure counts
-- Throughput (requests/sec and tokens/sec)
-- Latency percentiles (p50/p95/p99) for TTFT and total latency
+- Throughput (requests/sec, output tokens/sec, input tokens/sec)
+- Latency percentiles (p50/p90/p95/p99) for TTFT, total latency (E2E),
+  time-per-output-token (TPOT) and inter-token latency (ITL)
+- Goodput: requests/sec that met the TTFT and TPOT SLOs
 - Error breakdown
 
 Also provides side-by-side comparison (compare_reports), pretty-printing
@@ -18,6 +20,8 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING
 
+import httpx
+
 import numpy as np
 
 if TYPE_CHECKING:
@@ -27,10 +31,21 @@ if TYPE_CHECKING:
 # ── Build report ──────────────────────────────────────────────────────────────
 
 
+def _pcts(values: list[float]) -> dict:
+    if not values:
+        return {"p50": 0.0, "p90": 0.0, "p95": 0.0, "p99": 0.0, "mean": 0.0}
+    arr = np.array(values, dtype=float)
+    p50, p90, p95, p99 = np.percentile(arr, [50, 90, 95, 99])
+    return {"p50": float(p50), "p90": float(p90), "p95": float(p95),
+            "p99": float(p99), "mean": float(np.mean(arr))}
+
+
 def build_report(
     results: list["RequestResult"],
     test_duration_s: float,
     server_label: str,
+    slo_ttft_ms: float = 2000.0,
+    slo_tpot_ms: float = 100.0,
 ) -> dict:
     """Aggregate RequestResult list into a structured report dict.
 
@@ -48,9 +63,8 @@ def build_report(
     dict with keys: server_label, total_requests, successful, failed,
     success_rate_pct, test_duration_s, throughput_requests_per_sec,
     throughput_tokens_per_sec, latency (ttft_ms + total_latency_ms p-tiles),
-    errors (message → count).
+    errors (message → count), plus itl/tpot percentiles and goodput.
     """
-    _zero_pcts = {"p50": 0.0, "p95": 0.0, "p99": 0.0, "mean": 0.0}
 
     total = len(results)
     successful = [r for r in results if r.success]
@@ -67,20 +81,26 @@ def build_report(
     req_tps = n_ok / test_duration_s if test_duration_s > 0 else 0.0
     tok_tps = tokens_total / test_duration_s if test_duration_s > 0 else 0.0
 
+    prompt_tokens_total = sum(
+        getattr(r, "prompt_tokens", None) or 0 for r in successful
+    )
+    cached_tokens_total = sum(
+        getattr(r, "cached_prompt_tokens", None) or 0 for r in successful
+    )
+
     # Latency percentiles — only from successful requests with non-None values
     ttft_values = [r.ttft_ms for r in successful if r.ttft_ms is not None]
     lat_values = [r.total_latency_ms for r in successful if r.total_latency_ms is not None]
+    itl_values = [gap for r in successful for gap in (getattr(r, "itl_ms", None) or [])]
+    tpot_values = [t for r in successful if (t := getattr(r, "tpot_ms", None)) is not None]
 
-    def _pcts(values: list[float]) -> dict:
-        if not values:
-            return dict(_zero_pcts)
-        arr = np.array(values, dtype=float)
-        return {
-            "p50": float(np.percentile(arr, 50)),
-            "p95": float(np.percentile(arr, 95)),
-            "p99": float(np.percentile(arr, 99)),
-            "mean": float(np.mean(arr)),
-        }
+    # Goodput: requests that met both SLOs (TPOT only checked when defined).
+    def _meets_slo(r) -> bool:
+        tpot = getattr(r, "tpot_ms", None)
+        return (r.ttft_ms is not None and r.ttft_ms <= slo_ttft_ms
+                and (tpot is None or tpot <= slo_tpot_ms))
+
+    n_good = sum(1 for r in successful if _meets_slo(r))
 
     # Error breakdown
     errors: dict[str, int] = {}
@@ -97,9 +117,24 @@ def build_report(
         "test_duration_s": test_duration_s,
         "throughput_requests_per_sec": req_tps,
         "throughput_tokens_per_sec": tok_tps,
+        "throughput_input_tokens_per_sec": (
+            prompt_tokens_total / test_duration_s if test_duration_s > 0 else 0.0
+        ),
+        "total_output_tokens": tokens_total,
+        "total_input_tokens": prompt_tokens_total,
+        "cached_prompt_tokens": cached_tokens_total,
+        "goodput": {
+            "slo_ttft_ms": slo_ttft_ms,
+            "slo_tpot_ms": slo_tpot_ms,
+            "requests_meeting_slo": n_good,
+            "pct": (100.0 * n_good / total) if total else 0.0,
+            "requests_per_sec": n_good / test_duration_s if test_duration_s > 0 else 0.0,
+        },
         "latency": {
             "ttft_ms": _pcts(ttft_values),
             "total_latency_ms": _pcts(lat_values),
+            "tpot_ms": _pcts(tpot_values),
+            "itl_ms": _pcts(itl_values),
         },
         "errors": errors,
     }
@@ -173,6 +208,8 @@ def print_report_table(report: dict) -> None:
     lat = report.get("latency", {})
     ttft = lat.get("ttft_ms", {})
     total_lat = lat.get("total_latency_ms", {})
+    itl = lat.get("itl_ms", {})
+    tpot = lat.get("tpot_ms", {})
 
     lines = [
         sep,
@@ -185,20 +222,18 @@ def print_report_table(report: dict) -> None:
         row("Test duration:", f"{report.get('test_duration_s', 0.0):.2f}s"),
         sep,
         row("Throughput (req/s):", f"{report.get('throughput_requests_per_sec', 0.0):.2f}"),
-        row("Throughput (tok/s):", f"{report.get('throughput_tokens_per_sec', 0.0):.2f}"),
+        row("Throughput (output tok/s):", f"{report.get('throughput_tokens_per_sec', 0.0):.2f}"),
+        row("Throughput (input tok/s):", f"{report.get('throughput_input_tokens_per_sec', 0.0):.2f}"),
+        row("Goodput (req/s in SLO):",
+            f"{report.get('goodput', {}).get('requests_per_sec', 0.0):.2f}"),
         sep,
-        "  TTFT (ms)",
-        row("  p50:", f"{ttft.get('p50', 0.0):.1f}"),
-        row("  p95:", f"{ttft.get('p95', 0.0):.1f}"),
-        row("  p99:", f"{ttft.get('p99', 0.0):.1f}"),
-        row("  mean:", f"{ttft.get('mean', 0.0):.1f}"),
-        sep,
-        "  Total Latency (ms)",
-        row("  p50:", f"{total_lat.get('p50', 0.0):.1f}"),
-        row("  p95:", f"{total_lat.get('p95', 0.0):.1f}"),
-        row("  p99:", f"{total_lat.get('p99', 0.0):.1f}"),
-        row("  mean:", f"{total_lat.get('mean', 0.0):.1f}"),
+        f"  {'Latency (ms)':<14}{'p50':>9}{'p90':>9}{'p95':>9}{'p99':>9}",
     ]
+    for name, stats in (("TTFT", ttft), ("TPOT", tpot), ("ITL", itl), ("E2E", total_lat)):
+        lines.append(
+            f"  {name:<14}{stats.get('p50', 0.0):>9.1f}{stats.get('p90', 0.0):>9.1f}"
+            f"{stats.get('p95', 0.0):>9.1f}{stats.get('p99', 0.0):>9.1f}"
+        )
 
     errors = report.get("errors", {})
     if errors:
@@ -248,3 +283,61 @@ def save_report_json(report: dict, filepath: str) -> None:
     with open(filepath, "w", encoding="utf-8") as fh:
         json.dump(report, fh, indent=2)
     print(f"Report saved to {filepath}")
+
+
+# ── Server-side metrics ──────────────────────────────────────────────────────
+
+
+async def scrape_metrics(base_url: str) -> dict:
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            return (await client.get(f"{base_url}/metrics")).json()
+    except Exception:
+        return {}
+
+
+def _counters(metrics: dict) -> dict:
+    engine = metrics.get("engine", {})
+    spec = metrics.get("speculative_decoding", {})
+    steps = metrics.get("engine_steps", {})
+    alloc = metrics.get("paged_kv_cache", {}).get("block_allocator", {})
+    return {
+        "prefix_query_tokens": alloc.get("prefix_cache_query_tokens", 0),
+        "prefix_hit_tokens": alloc.get("prefix_cache_hit_tokens", 0),
+        "preemptions_swap": engine.get("preemptions_swap", 0),
+        "preemptions_recompute": engine.get("preemptions_recompute", 0),
+        "spec_draft_tokens": spec.get("draft_tokens", 0),
+        "spec_accepted_tokens": spec.get("accepted_tokens", 0),
+        "steps": steps.get("total_steps", 0),
+        **{f"sum_{k}": v for k, v in steps.get("cumulative", {}).items()},
+    }
+
+
+def engine_summary(metrics: dict, before: dict | None = None) -> dict:
+    """Headline engine-side numbers from /metrics.
+
+    With *before* (an earlier /metrics snapshot of the same server), every
+    number covers only the interval between the two snapshots — e.g. one load
+    level of a sweep — instead of the server's lifetime.
+    """
+    if "engine" not in metrics:
+        return {}
+    now = _counters(metrics)
+    if before and "engine" in before:
+        prev = _counters(before)
+        now = {k: v - prev.get(k, 0) for k, v in now.items()}
+    steps = now["steps"] or 0
+    drafted = now["spec_draft_tokens"]
+    queried = now["prefix_query_tokens"]
+    return {
+        "interval": "since previous snapshot" if before else "server lifetime",
+        "prefix_cache_hit_rate": now["prefix_hit_tokens"] / queried if queried else None,
+        "preemptions_swap": now["preemptions_swap"],
+        "preemptions_recompute": now["preemptions_recompute"],
+        "spec_acceptance_rate": now["spec_accepted_tokens"] / drafted if drafted else None,
+        "engine_steps": steps,
+        "avg_batch_size": now.get("sum_num_seqs", 0) / steps if steps else None,
+        "avg_tokens_per_step": now.get("sum_num_tokens", 0) / steps if steps else None,
+        "avg_kv_utilization": now.get("sum_kv_utilization", 0) / steps if steps else None,
+        "gpu_memory": metrics.get("gpu_memory"),
+    }

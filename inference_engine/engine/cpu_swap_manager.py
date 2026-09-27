@@ -1,27 +1,31 @@
 """
 engine/cpu_swap_manager.py — Phase 9: CPU-side KV cache staging pool.
 
-Maintains a CPU tensor pool that mirrors the structure of the GPU/MPS paged
-pool.  Provides:
+Maintains a CPU tensor pool that mirrors the layout of the device paged pool
+(``[num_layers, num_cpu_blocks, block_size, num_kv_heads, head_dim]``).
+Provides:
 
-  swap_out()  — copy blocks from device pool to CPU pool, free device blocks.
-  swap_in()   — allocate new device blocks, copy from CPU pool back, free CPU
-                slots.
+  swap_out()  — copy a sequence's blocks from the device pool to CPU, then
+                release its device blocks.
+  swap_in()   — allocate fresh device blocks, copy the data back, free the
+                CPU slots.
 
-Used by the ContinuousBatchingScheduler to avoid killing sequences under
-memory pressure: instead of failing the incoming request with OOM, the
-scheduler swaps out a large running sequence to CPU, frees device blocks,
-and retries the allocation.
+Used by the ContinuousBatchingScheduler to preempt a running sequence under
+memory pressure without throwing its work away.
+
+Each swap is a single gather + a single device↔host copy covering every layer
+and block of the sequence (not one small copy per block per layer).  On CUDA
+the CPU pool is allocated in pinned memory so the copies run at full PCIe
+bandwidth.
 
 Thread-safe via threading.Lock.  No async anywhere.
-No vLLM / TGI / TensorRT-LLM internals.
 """
 
 from __future__ import annotations
 
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
@@ -60,8 +64,8 @@ class SwappedSequence:
     seq_id
         UUID hex string of the swapped-out sequence.
     cpu_block_ids
-        Indices into CPUSwapManager.cpu_key_pool / cpu_value_pool that hold
-        the copied KV data (in the same order as the original device blocks).
+        Indices into the CPU pools holding the copied KV data (same order as
+        the original device block table).
     num_tokens
         Total number of filled token slots across all blocks at swap-out time.
     swapped_at
@@ -104,20 +108,22 @@ class CPUSwapManager:
         self.block_size = block_size
         self.num_cpu_blocks = num_cpu_blocks
 
-        # ── CPU tensor pool — always pinned to CPU regardless of model device ─
-        # Shape: [num_cpu_blocks, block_size, num_layers, num_kv_heads, head_dim]
+        # Pinned host memory makes device↔host copies fast; only meaningful
+        # (and only allowed) when a CUDA device is present.
+        pin = kv_cache_config.device == "cuda" and torch.cuda.is_available()
+        shape = [
+            kv_cache_config.num_layers,
+            num_cpu_blocks,
+            block_size,
+            kv_cache_config.num_kv_heads,
+            kv_cache_config.head_dim,
+        ]
         self.cpu_key_pool: torch.Tensor = torch.zeros(
-            [
-                num_cpu_blocks,
-                block_size,
-                kv_cache_config.num_layers,
-                kv_cache_config.num_kv_heads,
-                kv_cache_config.head_dim,
-            ],
-            dtype=kv_cache_config.dtype,
-            device="cpu",
+            shape, dtype=kv_cache_config.dtype, device="cpu", pin_memory=pin
         )
-        self.cpu_value_pool: torch.Tensor = torch.zeros_like(self.cpu_key_pool)
+        self.cpu_value_pool: torch.Tensor = torch.zeros(
+            shape, dtype=kv_cache_config.dtype, device="cpu", pin_memory=pin
+        )
 
         # Free CPU block index pool
         self._free_cpu_block_ids: list[int] = list(range(num_cpu_blocks))
@@ -133,6 +139,10 @@ class CPUSwapManager:
 
         self._lock = threading.Lock()
 
+    def num_free_blocks(self) -> int:
+        with self._lock:
+            return len(self._free_cpu_block_ids)
+
     # ── swap_out ──────────────────────────────────────────────────────────────
 
     def swap_out(
@@ -143,24 +153,6 @@ class CPUSwapManager:
         block_allocator: "BlockAllocator",
     ) -> SwappedSequence:
         """Copy *seq_id*'s KV blocks from the device pool to CPU, then free device blocks.
-
-        Parameters
-        ----------
-        seq_id:
-            The sequence whose KV cache will be moved to CPU.
-        device_block_ids:
-            List of device-side block IDs currently held by this sequence
-            (in allocation order).  Typically obtained via
-            ``block_allocator.get_blocks(seq_id)``.
-        paged_kv_cache:
-            The live device-side KV pool.
-        block_allocator:
-            The device-side block allocator.
-
-        Returns
-        -------
-        SwappedSequence
-            Metadata record for the swapped-out sequence.
 
         Raises
         ------
@@ -177,35 +169,27 @@ class CPUSwapManager:
                     requested=num_needed,
                     available=len(self._free_cpu_block_ids),
                 )
+            cpu_block_ids = self._free_cpu_block_ids[:num_needed]
+            del self._free_cpu_block_ids[:num_needed]
 
-            # Claim CPU block IDs while holding the lock
-            cpu_block_ids: list[int] = []
-            for _ in range(num_needed):
-                cpu_block_ids.append(self._free_cpu_block_ids.pop(0))
-
-        # Copy device → CPU (outside the lock — tensor ops can run freely)
-        num_layers = self.kv_cache_config.num_layers
         try:
-            for dev_bid, cpu_bid in zip(device_block_ids, cpu_block_ids):
-                for layer_idx in range(num_layers):
-                    # Shape of each slice: [block_size, num_kv_heads, head_dim]
-                    self.cpu_key_pool[cpu_bid, :, layer_idx].copy_(
-                        paged_kv_cache.key_pool[dev_bid, :, layer_idx]
-                    )
-                    self.cpu_value_pool[cpu_bid, :, layer_idx].copy_(
-                        paged_kv_cache.value_pool[dev_bid, :, layer_idx]
-                    )
+            if num_needed:
+                dev_idx = torch.tensor(device_block_ids, dtype=torch.long,
+                                       device=paged_kv_cache.key_pool.device)
+                cpu_idx = torch.tensor(cpu_block_ids, dtype=torch.long)
+                # One gather over all layers, one device→host copy.
+                keys = paged_kv_cache.key_pool.index_select(1, dev_idx).cpu()
+                values = paged_kv_cache.value_pool.index_select(1, dev_idx).cpu()
+                self.cpu_key_pool[:, cpu_idx] = keys
+                self.cpu_value_pool[:, cpu_idx] = values
         except Exception:
             with self._lock:
                 self._free_cpu_block_ids.extend(cpu_block_ids)
             raise
 
-        # Count total filled tokens before zeroing/freeing
         num_tokens = block_allocator.num_tokens_for_seq(seq_id)
-
-        # Zero device pool slots AFTER copying data (spec requirement)
-        paged_kv_cache.clear_sequence(seq_id)
-        # Release device blocks
+        # Release device blocks.  Shared prefix blocks stay alive for their
+        # other users; private hashed blocks become evictable cache entries.
         block_allocator.free(seq_id)
 
         swapped = SwappedSequence(
@@ -237,20 +221,6 @@ class CPUSwapManager:
         differ from the original), copies data from CPU, then frees the CPU
         staging slots.
 
-        Parameters
-        ----------
-        seq_id:
-            The sequence to restore.
-        paged_kv_cache:
-            The live device-side KV pool.
-        block_allocator:
-            The device-side block allocator.
-
-        Returns
-        -------
-        list[int]
-            Newly allocated device block IDs (in allocation order).
-
         Raises
         ------
         KeyError
@@ -267,33 +237,40 @@ class CPUSwapManager:
         # Try to claim device blocks — let OutOfBlocksError propagate
         device_block_ids: list[int] = block_allocator.allocate(
             seq_id, swapped.original_num_blocks
-        )
+        ) if swapped.original_num_blocks else []
 
-        # Copy CPU → device
-        num_layers = self.kv_cache_config.num_layers
         try:
-            for dev_bid, cpu_bid in zip(device_block_ids, swapped.cpu_block_ids):
-                for layer_idx in range(num_layers):
-                    paged_kv_cache.key_pool[dev_bid, :, layer_idx].copy_(
-                        self.cpu_key_pool[cpu_bid, :, layer_idx]
-                    )
-                    paged_kv_cache.value_pool[dev_bid, :, layer_idx].copy_(
-                        self.cpu_value_pool[cpu_bid, :, layer_idx]
-                    )
+            if device_block_ids:
+                device = paged_kv_cache.key_pool.device
+                cpu_idx = torch.tensor(swapped.cpu_block_ids, dtype=torch.long)
+                dev_idx = torch.tensor(device_block_ids, dtype=torch.long, device=device)
+                keys = self.cpu_key_pool.index_select(1, cpu_idx).to(device)
+                values = self.cpu_value_pool.index_select(1, cpu_idx).to(device)
+                paged_kv_cache.key_pool[:, dev_idx] = keys
+                paged_kv_cache.value_pool[:, dev_idx] = values
         except Exception:
             block_allocator.free(seq_id)
             raise
 
-        block_allocator.set_token_count(seq_id, swapped.num_tokens)
+        if device_block_ids:
+            block_allocator.set_token_count(seq_id, swapped.num_tokens)
 
         with self._lock:
-            # Return CPU blocks to the free pool
             self._free_cpu_block_ids.extend(swapped.cpu_block_ids)
             del self._swapped[seq_id]
             self._total_swap_ins += 1
             self._total_swap_in_tokens += swapped.num_tokens
 
         return device_block_ids
+
+    def discard(self, seq_id: str) -> bool:
+        """Drop a swapped sequence's CPU copy (e.g. the request was aborted)."""
+        with self._lock:
+            swapped = self._swapped.pop(seq_id, None)
+            if swapped is None:
+                return False
+            self._free_cpu_block_ids.extend(swapped.cpu_block_ids)
+            return True
 
     # ── Query ─────────────────────────────────────────────────────────────────
 
@@ -308,15 +285,7 @@ class CPUSwapManager:
             return self._swapped.get(seq_id)
 
     def stats(self) -> dict:
-        """Return a snapshot of CPUSwapManager state.
-
-        Returns
-        -------
-        dict with keys:
-            num_cpu_blocks, free_cpu_blocks, swapped_sequences,
-            total_swap_outs, total_swap_ins,
-            total_swap_out_tokens, total_swap_in_tokens, swapped_seq_ids
-        """
+        """Return a snapshot of CPUSwapManager state."""
         with self._lock:
             return {
                 "num_cpu_blocks": self.num_cpu_blocks,
