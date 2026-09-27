@@ -2,8 +2,10 @@
  * simulation.ts — Deterministic scheduler simulation engine.
  *
  * Generates tick-by-tick state traces for all animated visualizations.
- * All timing ratios are derived from real benchmark data (baseline_metrics.json,
- * bench_phases_results.json). No randomness — the same trace always plays.
+ * Illustrative only — every visualisation that uses these traces is labelled
+ * "Demo data". The Phase 1 vs 2 timelines replay v2 (legacy) M2 measurements
+ * (baseline_metrics.json, bench_direct_results.json). No randomness — the same
+ * trace always plays.
  *
  * Used by:
  *   - HeroSection (live scheduler panel)
@@ -13,7 +15,7 @@
  *   - CPUSwapSection (swap event log)
  */
 
-import { ENGINE_CONFIG } from './benchmarks';
+import { DEMO_CONFIG as ENGINE_CONFIG } from './engine';
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 
@@ -300,20 +302,24 @@ export interface SwapEventLogEntry {
 }
 
 /**
- * Deterministic replay of a burst-load scenario showing CPU swap path.
- * Based on the scheduler._try_swap_out_victim() logic in scheduler.py.
+ * Deterministic replay of a memory-pressure scenario under the v3 policy:
+ * FCFS admission (a new request waits for free blocks — it never evicts anyone)
+ * and LIFO preemption (when a *running* sequence can't grow, the most recently
+ * arrived one is preempted: swapped to pinned CPU memory if it is decoding,
+ * otherwise its blocks are dropped and it is recomputed later).
+ * Block counts match the pools drawn in CPUSwapSection (1 cell = 8 blocks).
  */
 export const CPU_SWAP_EVENT_LOG: SwapEventLogEntry[] = [
-  { timeMs: 0,    type: 'admit',    message: 'seq-e5f6 arrives → request admitted to queue',    seqId: 'e5f6' },
-  { timeMs: 80,   type: 'admit',    message: 'seq-e5f6 prefill start → allocate 7 blocks',       seqId: 'e5f6', blocks: 7 },
-  { timeMs: 120,  type: 'oom',      message: 'OutOfBlocksError: 7 requested, 5 available',       seqId: 'e5f6' },
-  { timeMs: 140,  type: 'swap_out', message: 'SWAP_OUT: victim=seq-c3d4 (12 blocks, largest)',   seqId: 'c3d4', blocks: 12 },
-  { timeMs: 180,  type: 'swap_out', message: 'KV tensors copied to CPU staging pool',            seqId: 'c3d4', blocks: 12 },
-  { timeMs: 210,  type: 'alloc',    message: 'seq-e5f6 retry → allocate 7 blocks (success)',     seqId: 'e5f6', blocks: 7 },
-  { timeMs: 250,  type: 'decode',   message: 'seq-e5f6 decoding…',                               seqId: 'e5f6' },
-  { timeMs: 1100, type: 'resume',   message: 'seq-e5f6 done → seq-c3d4 SWAP_IN: GPU blocks restored', seqId: 'c3d4', blocks: 12 },
-  { timeMs: 1150, type: 'decode',   message: 'seq-c3d4 resumed decoding from token 18',          seqId: 'c3d4' },
-  { timeMs: 1560, type: 'done',     message: 'seq-c3d4 finished (50 tokens). 0 requests dropped.', seqId: 'c3d4' },
+  { timeMs: 0,    type: 'admit',    message: 'seq-e5f6 arrives → waits: needs 6 blocks, 2 free (FCFS, no eviction)', seqId: 'e5f6' },
+  { timeMs: 40,   type: 'decode',   message: 'seq-a1b2 and seq-g7h8 grow into the last free blocks',              seqId: 'a1b2', blocks: 2 },
+  { timeMs: 80,   type: 'oom',      message: 'seq-a1b2 needs 1 more block — pool exhausted',                       seqId: 'a1b2', blocks: 1 },
+  { timeMs: 90,   type: 'swap_out', message: 'preempt newest running sequence: victim=seq-c3d4 (LIFO)',           seqId: 'c3d4', blocks: 12 },
+  { timeMs: 120,  type: 'swap_out', message: 'seq-c3d4 is decoding → KV swapped to pinned CPU pool',              seqId: 'c3d4', blocks: 12 },
+  { timeMs: 150,  type: 'alloc',    message: 'seq-a1b2 gets its block and keeps decoding',                        seqId: 'a1b2', blocks: 1 },
+  { timeMs: 900,  type: 'done',     message: 'seq-a1b2 finished → its blocks are freed',                          seqId: 'a1b2', blocks: 12 },
+  { timeMs: 920,  type: 'resume',   message: 'seq-c3d4 swapped back in first — no admissions while it waits',     seqId: 'c3d4', blocks: 12 },
+  { timeMs: 960,  type: 'admit',    message: 'seq-e5f6 admitted now that blocks are free',                        seqId: 'e5f6', blocks: 6 },
+  { timeMs: 1600, type: 'done',     message: 'all sequences finished · 0 requests dropped',                         seqId: 'c3d4' },
 ];
 
 // ── Phase 1 vs Phase 2 timeline data ──────────────────────────────────────────

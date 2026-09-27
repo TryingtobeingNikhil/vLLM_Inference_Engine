@@ -5,54 +5,54 @@ import { SectionHeader, Accent } from '@/components/ui/SectionHeader';
 import { Card } from '@/components/ui/Card';
 import { Reveal } from '@/components/ui/Reveal';
 import { useInView, usePrefersReducedMotion } from '@/lib/motion';
-import { ENGINE_CONFIG } from '@/data/benchmarks';
 
+// One scheduler step (README "How it works"): plan → pack → execute → apply.
 const LOOP_STEPS = [
   {
     step: '01',
-    label: 'Admit',
-    title: 'RequestQueue',
+    label: 'Plan',
+    title: 'Pick this step’s work',
     lines: [
-      `FIFO ordering`,
-      `maxsize: ${ENGINE_CONFIG.max_batch_size * 8}`,
-      `timeout: 30s`,
-      `→ 429 when full`,
+      `decodes: 1 token each (+k spec)`,
+      `prefill chunks ≤ token budget`,
+      `admit if blocks allow (FCFS)`,
+      `prefix-cache hits reused`,
     ],
     color: '#60A5FA',
   },
   {
     step: '02',
-    label: 'Prefill',
-    title: 'Chunked Prefill',
+    label: 'Pack',
+    title: 'One [1, T] batch',
     lines: [
-      `budget: ${ENGINE_CONFIG.prefill_budget_tokens} tok/step`,
-      `chunk: ${ENGINE_CONFIG.prefill_chunk_size} tok`,
-      `allocate blocks`,
-      `write KV pool`,
+      `concat every scheduled token`,
+      `explicit position_ids`,
+      `slot mapping per token`,
+      `no padding through MLPs`,
     ],
     color: '#FBBF24',
   },
   {
     step: '03',
-    label: 'Decode',
-    title: 'Decode Loop',
+    label: 'Execute',
+    title: 'One forward pass',
     lines: [
-      `limit: ${ENGINE_CONFIG.decode_batch_limit} seqs`,
-      `1 token per seq`,
-      `live KV cache`,
-      `~11 ms/step`,
+      `HF model, paged attention`,
+      `writes K/V into the pool`,
+      `reads context via block tables`,
+      `logits only where sampled`,
     ],
     color: '#4ADE80',
   },
   {
     step: '04',
-    label: 'Evict',
-    title: 'Block Reclaim',
+    label: 'Apply',
+    title: 'Tokens out, blocks back',
     lines: [
-      `free block alloc`,
-      `clear KV pool`,
-      `update metrics`,
-      `admit next seq`,
+      `append / verify tokens`,
+      `stream them (SSE)`,
+      `publish full blocks to cache`,
+      `finish + free`,
     ],
     color: '#A78BFA',
   },
@@ -135,37 +135,43 @@ function LoopSteps() {
 type Node = { x: number; y: number; w: number; label: string; sub: string; color?: string; strong?: boolean };
 const H = 40;
 const NODES: Record<string, Node> = {
-  req:   { x: 12,  y: 130, w: 104, label: 'Request',        sub: 'POST /generate' },
-  queue: { x: 150, y: 130, w: 150, label: 'RequestQueue',   sub: 'FIFO · 429 when full' },
-  sched: { x: 334, y: 130, w: 156, label: 'Scheduler Loop', sub: 'asyncio task', strong: true },
-  pre:   { x: 540, y: 40,  w: 156, label: 'Prefill Stage',  sub: '≤512 tok / iter', color: '#FBBF24' },
-  dec:   { x: 540, y: 220, w: 156, label: 'Decode Stage',   sub: '1 tok / seq / iter', color: '#4ADE80' },
-  kv:    { x: 746, y: 130, w: 168, label: 'PagedKVCache',   sub: '256 × 16-tok blocks', color: '#60A5FA' },
-  cpu:   { x: 746, y: 250, w: 168, label: 'CPUSwapPool',    sub: '128 host blocks', color: '#FB7185' },
+  client: { x: 12,  y: 130, w: 120, label: 'Client',           sub: 'SSE · OpenAI API' },
+  queue:  { x: 160, y: 130, w: 140, label: 'RequestQueue',     sub: 'FIFO · backpressure' },
+  sched:  { x: 330, y: 130, w: 170, label: 'Scheduler',        sub: 'plan → execute → apply', strong: true },
+  runner: { x: 540, y: 130, w: 190, label: 'ModelRunner',      sub: 'ONE packed pass · [1, T]', color: '#4ADE80' },
+  attn:   { x: 540, y: 230, w: 190, label: 'Paged attention',  sub: 'HF attention backend', color: '#4ADE80' },
+  alloc:  { x: 770, y: 40,  w: 190, label: 'BlockAllocator',   sub: 'block tables · prefix cache', color: '#22D3EE' },
+  kv:     { x: 770, y: 130, w: 190, label: 'PagedKVCache',     sub: '[layers, blocks, 16, H, D]', color: '#60A5FA' },
+  cpu:    { x: 770, y: 230, w: 190, label: 'CPUSwapManager',   sub: 'pinned host RAM', color: '#FB7185' },
 };
 
+const GREY = '#767680';
 const EDGES = [
-  { id: 'e1', d: 'M116,150 L148,150', color: '#767680' },
-  { id: 'e2', d: 'M300,150 L332,150', color: '#767680' },
-  { id: 'e3', d: 'M490,142 C515,142 512,60 538,60', color: '#FBBF24' },
-  { id: 'e4', d: 'M490,158 C515,158 512,240 538,240', color: '#4ADE80' },
-  { id: 'e5', d: 'M696,60 C724,60 718,140 744,140', color: '#767680' },
-  { id: 'e6', d: 'M696,240 C724,240 718,160 744,160', color: '#767680' },
-  { id: 'swapout', d: 'M810,170 L810,248', color: '#FB7185' },
-  { id: 'swapin', d: 'M914,270 C952,270 952,150 916,150', color: '#FB7185' },
-  { id: 'loop', d: 'M540,252 C470,300 420,260 412,172', color: '#A78BFA' },
+  { id: 'in1',     d: 'M132,150 L158,150', color: GREY },
+  { id: 'in2',     d: 'M300,150 L328,150', color: GREY },
+  { id: 'pack',    d: 'M500,150 L538,150', color: '#4ADE80' },
+  { id: 'fwd',     d: 'M635,170 L635,228', color: '#4ADE80' },
+  { id: 'kvio',    d: 'M730,250 C752,250 748,160 768,160', color: '#60A5FA' },
+  { id: 'plan',    d: 'M415,130 C415,72 440,60 500,60 L768,60', color: '#22D3EE' },
+  { id: 'tables',  d: 'M865,80 L865,128', color: '#22D3EE' },
+  { id: 'swapout', d: 'M865,170 L865,228', color: '#FB7185' },
+  { id: 'swapin',  d: 'M960,250 C990,250 990,150 962,150', color: '#FB7185' },
+  { id: 'sampled', d: 'M560,170 C540,212 440,212 420,172', color: '#A78BFA' },
+  { id: 'stream',  d: 'M340,170 C300,228 130,228 72,172', color: '#A78BFA' },
 ];
+const edge = (id: string) => EDGES.find((e) => e.id === id)!.d;
 
-// Packets that ride the edges — the request's journey through one iteration.
+// Packets that ride the edges: one request's trip through a scheduler step.
 const PACKETS = [
-  { path: 'M116,150 L332,150', color: '#EDEDEF', dur: 2.4, begin: 0 },
-  { path: EDGES[2].d, color: '#FBBF24', dur: 1.6, begin: 0.4 },
-  { path: EDGES[3].d, color: '#4ADE80', dur: 1.6, begin: 1.2 },
-  { path: EDGES[4].d, color: '#FBBF24', dur: 1.6, begin: 1.6 },
-  { path: EDGES[5].d, color: '#4ADE80', dur: 1.6, begin: 2.2 },
-  { path: EDGES[8].d, color: '#A78BFA', dur: 2.2, begin: 0.8 },
-  { path: EDGES[6].d, color: '#FB7185', dur: 2.6, begin: 1.0 },
-  { path: EDGES[7].d, color: '#FB7185', dur: 2.6, begin: 2.3 },
+  { path: 'M132,150 L328,150', color: '#EDEDEF', dur: 2.4, begin: 0 },
+  { path: edge('plan'), color: '#22D3EE', dur: 2.2, begin: 0.3 },
+  { path: edge('pack'), color: '#4ADE80', dur: 1.2, begin: 0.6 },
+  { path: edge('fwd'), color: '#4ADE80', dur: 1.2, begin: 1.1 },
+  { path: edge('kvio'), color: '#60A5FA', dur: 1.4, begin: 1.6 },
+  { path: edge('sampled'), color: '#A78BFA', dur: 1.8, begin: 1.4 },
+  { path: edge('stream'), color: '#A78BFA', dur: 2.4, begin: 2.0 },
+  { path: edge('swapout'), color: '#FB7185', dur: 2.6, begin: 1.0 },
+  { path: edge('swapin'), color: '#FB7185', dur: 2.6, begin: 2.3 },
 ];
 
 function ArchitectureDiagram() {
@@ -174,9 +180,9 @@ function ArchitectureDiagram() {
 
   return (
     <div ref={ref} className="overflow-x-auto">
-      <svg viewBox="0 0 980 320" className="min-w-[760px] w-full" style={{ fontFamily: 'var(--font-mono), monospace' }} role="img" aria-label="System architecture: requests flow through the queue into the scheduler loop, which drives prefill and decode stages backed by a paged KV cache and a CPU swap pool.">
+      <svg viewBox="0 0 1000 310" className="w-full min-w-[780px]" style={{ fontFamily: 'var(--font-mono), monospace' }} role="img" aria-label="System architecture: requests flow through the queue into the scheduler, which packs all work into one forward pass; a paged attention backend reads and writes the KV pool through block tables, with a CPU swap pool for preemption.">
         <defs>
-          {['#767680', '#FBBF24', '#4ADE80', '#FB7185', '#A78BFA'].map((c) => (
+          {[GREY, '#4ADE80', '#60A5FA', '#22D3EE', '#FB7185', '#A78BFA'].map((c) => (
             <marker key={c} id={`arr-${c.slice(1)}`} markerWidth="8" markerHeight="8" refX="6.5" refY="4" orient="auto">
               <path d="M1,1 L7,4 L1,7" fill="none" stroke={c} strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
             </marker>
@@ -198,17 +204,21 @@ function ArchitectureDiagram() {
             d={e.d}
             fill="none"
             stroke={e.color}
-            strokeOpacity={e.color === '#767680' ? 0.7 : 0.75}
+            strokeOpacity={e.color === GREY ? 0.7 : 0.75}
             strokeWidth="1.3"
-            className={e.id === 'loop' || e.id.startsWith('swap') ? 'flow-slow' : e.color !== '#767680' ? 'flow' : undefined}
+            className={e.id === 'stream' || e.id === 'sampled' || e.id.startsWith('swap') ? 'flow-slow' : e.color !== GREY ? 'flow' : undefined}
             markerEnd={`url(#arr-${e.color.slice(1)})`}
           />
         ))}
 
         {/* Edge labels */}
-        <text x="800" y="214" fill="#FB7185" fontSize="10" textAnchor="end">swap_out</text>
-        <text x="954" y="214" fill="#FB7185" fontSize="10" textAnchor="middle">swap_in</text>
-        <text x="448" y="292" fill="#A78BFA" fontSize="10" textAnchor="middle">next iteration ↺</text>
+        <text x="600" y="52" fill="#22D3EE" fontSize="10" textAnchor="middle">plan: allocate blocks · reuse prefix hits</text>
+        <text x="873" y="108" fill="#22D3EE" fontSize="10">block tables</text>
+        <text x="857" y="204" fill="#FB7185" fontSize="10" textAnchor="end">preempt: swap</text>
+        <text x="978" y="205" fill="#FB7185" fontSize="10" textAnchor="middle">swap_in</text>
+        <text x="635" y="292" fill="#60A5FA" fontSize="10" textAnchor="middle">write K/V · read context via block tables</text>
+        <text x="484" y="224" fill="#A78BFA" fontSize="10" textAnchor="middle">sampled tokens</text>
+        <text x="205" y="238" fill="#A78BFA" fontSize="10" textAnchor="middle">stream tokens (SSE)</text>
 
         {/* Nodes */}
         {Object.entries(NODES).map(([id, n]) => {
@@ -257,8 +267,8 @@ export function SchedulerLiveSection() {
         <SectionHeader
           index="01"
           label="Scheduler loop"
-          title={<>One token per sequence, <Accent gradient>every iteration.</Accent></>}
-          subtitle="At every iteration, all active sequences advance by exactly one decode token. No single request monopolizes the GPU."
+          title={<>All the work, <Accent gradient>one forward pass.</Accent></>}
+          subtitle="Every scheduler step packs the prefill chunks of new prompts and one decode token per running sequence into a single forward pass. Requests join and leave the batch between steps."
         />
 
         <LoopSteps />
@@ -268,9 +278,10 @@ export function SchedulerLiveSection() {
             <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
               <p className="font-mono text-[11px] uppercase tracking-[0.16em] text-fg-3">System architecture</p>
               <div className="flex flex-wrap gap-4 font-mono text-[10.5px] text-fg-3">
-                <span className="flex items-center gap-1.5"><span className="h-px w-4 bg-amber" />prefill path</span>
-                <span className="flex items-center gap-1.5"><span className="h-px w-4 bg-mint" />decode path</span>
-                <span className="flex items-center gap-1.5"><span className="h-px w-4 bg-rose" />memory pressure</span>
+                <span className="flex items-center gap-1.5"><span className="h-px w-4 bg-mint" />packed forward pass</span>
+                <span className="flex items-center gap-1.5"><span className="h-px w-4 bg-sky" />KV via block tables</span>
+                <span className="flex items-center gap-1.5"><span className="h-px w-4 bg-violet" />tokens back</span>
+                <span className="flex items-center gap-1.5"><span className="h-px w-4 bg-rose" />preemption</span>
               </div>
             </div>
             <ArchitectureDiagram />
@@ -283,12 +294,12 @@ export function SchedulerLiveSection() {
               <svg viewBox="0 0 16 16" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.6"><path d="M8 1.5v3M8 11.5v3M1.5 8h3M11.5 8h3M3.4 3.4l2.1 2.1M10.5 10.5l2.1 2.1M3.4 12.6l2.1-2.1M10.5 5.5l2.1-2.1" strokeLinecap="round" /></svg>
             </span>
             <p className="text-[14px] leading-relaxed text-fg-2">
-              <span className="font-medium text-fg">Iteration-level scheduling.</span> Unlike Phase 1&apos;s{' '}
-              <code className="rounded bg-white/5 px-1 font-mono text-[0.85em] text-fg">asyncio.Lock</code>, which blocks every
-              request until generation completes, the scheduler advances <span className="text-fg">every sequence</span> by
-              exactly one token per iteration, then yields. TTFT under 4-way load drops from{' '}
-              <span className="font-mono text-rose line-through decoration-rose/50">1,418 ms</span> to{' '}
-              <span className="font-mono text-mint">20.9 ms</span>.
+              <span className="font-medium text-fg">One number drives scheduling.</span> Each sequence tracks{' '}
+              <code className="rounded bg-white/5 px-1 font-mono text-[0.85em] text-fg">num_computed_tokens</code>, the tokens that
+              already have K/V in the pool. A prefill chunk, a decode step and a recompute are the{' '}
+              <span className="text-fg">same operation</span> over the uncomputed tokens, which is why one forward pass can mix
+              them. Attention finds each token&apos;s slot as{' '}
+              <code className="rounded bg-white/5 px-1 font-mono text-[0.85em] text-fg">block_table[pos // 16] * 16 + pos % 16</code>.
             </p>
           </div>
         </Reveal>

@@ -4,7 +4,7 @@ import { useState } from 'react';
 import { SectionHeader, Accent } from '@/components/ui/SectionHeader';
 import { Card } from '@/components/ui/Card';
 import { Reveal } from '@/components/ui/Reveal';
-import { PHASES, type PhaseEntry } from '@/data/phases';
+import { PHASES, NEXT_STEPS, type PhaseEntry } from '@/data/phases';
 
 type Tag = PhaseEntry['tag'];
 
@@ -45,7 +45,14 @@ function PhaseRow({ phase, open, onToggle, muted }: { phase: PhaseEntry; open: b
         >
           <div className="flex w-full items-center gap-3">
             <span className="font-mono text-[11px] tabular-nums text-fg-4">{String(phase.phase).padStart(2, '0')}</span>
-            <span className="flex-1 text-[15px] font-medium text-fg">{phase.title}</span>
+            <span className="flex-1 text-[15px] font-medium text-fg">
+              {phase.title}
+              {phase.isNew && (
+                <span className="ml-2 inline-block rounded-full bg-gradient-to-r from-mint/20 to-violet/20 px-2 py-0.5 align-middle font-mono text-[9.5px] uppercase tracking-[0.12em] text-mint">
+                  new in v3
+                </span>
+              )}
+            </span>
             <span
               className="hidden rounded-full px-2 py-0.5 font-mono text-[9.5px] uppercase tracking-[0.14em] sm:inline"
               style={{ color, backgroundColor: `${color}14` }}
@@ -100,24 +107,19 @@ function PhaseRow({ phase, open, onToggle, muted }: { phase: PhaseEntry; open: b
   );
 }
 
-const NEXT_UP = [
-  { title: 'Tensor-level batching', desc: 'FlashAttention-2 or custom CUDA kernels instead of thread-based serialization.', icon: '↯' },
-  { title: 'Disconnect-aware cancellation', desc: 'Propagate client disconnects into admitted sequences to stop expensive decode work immediately.', icon: '✂' },
-  { title: 'Speculative decoding', desc: 'Integrate a draft model to verify candidate tokens in parallel.', icon: '◎' },
-  { title: 'Dynamic block sizing', desc: 'Experiment with block sizes 8 and 32 to study cache chunk overhead.', icon: '▦' },
-];
+const NEXT_ICONS = ['↯', '◎', '⚄', '⇶'];
 
 export function PhaseBuildLogSection() {
-  const [open, setOpen] = useState<number | null>(2);
+  const [open, setOpen] = useState<number | null>(12);
   const [filter, setFilter] = useState<Tag | 'all'>('all');
 
   return (
     <section id="phases" className="relative px-5 py-24 sm:px-6 sm:py-32">
       <div className="mx-auto max-w-5xl">
         <SectionHeader
-          index="05"
+          index="06"
           label="Development history"
-          title={<>Eleven phases, <Accent gradient>one engine.</Accent></>}
+          title={<>Twelve phases, <Accent gradient>one engine.</Accent></>}
           subtitle="PageServe was built phase by phase, retracing how production inference engines evolved. Open any phase for the problem it hit and how it was solved."
         />
 
@@ -171,17 +173,17 @@ export function PhaseBuildLogSection() {
         <div className="mt-14">
           <Reveal>
             <p className="mb-5 flex items-center gap-3">
-              <span className="accent-serif text-2xl text-fg">What I&apos;d do differently</span>
+              <span className="accent-serif text-2xl text-fg">Next steps</span>
               <span className="h-px flex-1 bg-gradient-to-r from-line-2 to-transparent" />
             </p>
           </Reveal>
           <div className="grid gap-3 sm:grid-cols-2">
-            {NEXT_UP.map((item, i) => (
+            {NEXT_STEPS.map((item, i) => (
               <Reveal key={item.title} delay={i * 70}>
                 <Card className="group h-full">
                   <div className="flex gap-4">
                     <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border border-line-2 bg-white/[0.03] text-fg-2 transition-transform duration-500 [transition-timing-function:var(--ease-spring)] group-hover:-rotate-6 group-hover:scale-110">
-                      {item.icon}
+                      {NEXT_ICONS[i % NEXT_ICONS.length]}
                     </span>
                     <div>
                       <p className="text-[14.5px] font-medium text-fg">{item.title}</p>

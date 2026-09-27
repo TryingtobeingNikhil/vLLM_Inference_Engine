@@ -8,7 +8,8 @@ import { Window } from '@/components/ui/Card';
 import { CountUp } from '@/components/ui/CountUp';
 import { StarButton } from '@/components/GitHubStats';
 import { BlockField } from '@/components/BlockField';
-import { ENGINE_CONFIG, SINGLE_REQUEST, PR_COMPARISON, TTFT_BATCHED_UNDER_LOAD_MS, TTFT_SEQUENTIAL_UNDER_LOAD_MS } from '@/data/benchmarks';
+import { DEMO_CONFIG, TESTS_PASSING, TOTAL_PHASES } from '@/data/engine';
+import { SMOKE_HIGHLIGHTS } from '@/data/gpuBenchmarks';
 import type { SimSequence, SeqState } from '@/data/simulation';
 
 const STATE_LABELS: Record<SeqState, string> = {
@@ -121,7 +122,7 @@ function SchedulerWindow() {
   const displaySeqs = sequences.slice(0, 5);
   const emptySlots = Math.max(0, 5 - displaySeqs.length);
   const totalBlocks = freeBlocks + allocatedBlocks;
-  const maxBatch = ENGINE_CONFIG.max_batch_size;
+  const maxBatch = DEMO_CONFIG.max_batch_size;
 
   return (
     <Window
@@ -211,14 +212,13 @@ function Stat({ label, value, className = '' }: { label: string; value: React.Re
 
 const PILLARS = [
   { label: 'Continuous batching', color: '#4ADE80' },
-  { label: 'Paged KV-cache', color: '#60A5FA' },
-  { label: 'Chunked prefill', color: '#FBBF24' },
-  { label: 'CPU swap pool', color: '#FB7185' },
+  { label: 'Paged attention', color: '#60A5FA' },
+  { label: 'Prefix caching', color: '#22D3EE' },
+  { label: 'Speculative decoding', color: '#A78BFA' },
+  { label: 'Swap / recompute preemption', color: '#FB7185' },
 ];
 
 export function HeroSection() {
-  const speedup = TTFT_SEQUENTIAL_UNDER_LOAD_MS / TTFT_BATCHED_UNDER_LOAD_MS;
-
   return (
     <section id="top" className="relative overflow-hidden pb-20 pt-32 sm:pt-40">
       {/* Interactive KV-block backdrop */}
@@ -234,8 +234,8 @@ export function HeroSection() {
           href="#phases"
           className="group mb-8 inline-flex items-center gap-2 rounded-full border border-line-2 bg-ink-900/60 py-1 pl-1 pr-3 text-[12.5px] text-fg-2 backdrop-blur transition-colors hover:border-white/20 hover:text-fg"
         >
-          <span className="whitespace-nowrap rounded-full bg-mint/15 px-2 py-0.5 font-mono text-[10.5px] text-mint">11 phases</span>
-          <span className="hidden sm:inline">Built from scratch · </span>{PR_COMPARISON.tests.passing}/{PR_COMPARISON.tests.total} tests green
+          <span className="whitespace-nowrap rounded-full bg-mint/15 px-2 py-0.5 font-mono text-[10.5px] text-mint">v3</span>
+          <span className="hidden sm:inline">Real GPU batching · {TOTAL_PHASES} phases · </span>{TESTS_PASSING} tests passing
           <span className="transition-transform duration-300 group-hover:translate-x-0.5">→</span>
         </a>
 
@@ -246,8 +246,9 @@ export function HeroSection() {
         </h1>
 
         <p className="mx-auto mt-7 max-w-2xl text-pretty text-base leading-relaxed text-fg-2 sm:text-lg">
-          <span className="text-fg">PageServe</span> is an LLM inference engine built from first principles —
-          continuous batching, a paged KV-cache, chunked prefill and a CPU swap pool. No vLLM. No{' '}
+          <span className="text-fg">PageServe</span> is an LLM inference engine built from scratch: continuous
+          batching over a paged KV cache, prefix caching, preemption and speculative decoding, in readable PyTorch.
+          Every step is <span className="text-fg">one packed forward pass</span>. No vLLM. No{' '}
           <code className="rounded-md border border-line bg-white/[0.04] px-1.5 py-0.5 font-mono text-[0.85em] text-fg">generate()</code>.
         </p>
 
@@ -283,25 +284,38 @@ export function HeroSection() {
         </p>
       </div>
 
-      {/* Headline numbers */}
-      <div className="relative mx-5 mt-14 grid max-w-5xl grid-cols-2 gap-px overflow-hidden rounded-2xl border border-line bg-line sm:mx-6 sm:grid-cols-4 lg:mx-auto">
-        <HeroStat value={<CountUp value={TTFT_BATCHED_UNDER_LOAD_MS} decimals={1} suffix=" ms" />} label="TTFT under 4-way load" />
-        <HeroStat value={<CountUp value={speedup} decimals={0} suffix="×" />} label="faster first token vs. sequential" accent />
-        <HeroStat value={<CountUp value={SINGLE_REQUEST.tps} decimals={1} />} unit="tok/s" label="single-stream decode" />
-        <HeroStat value="0" unit="OOM crashes" label="under burst load, via CPU swap" />
+      {/* Headline numbers — v3 local smoke runs, labelled as such */}
+      <div className="relative mx-5 mt-14 max-w-5xl sm:mx-6 lg:mx-auto">
+        <div className="grid grid-cols-2 gap-px overflow-hidden rounded-2xl border border-line bg-line sm:grid-cols-4">
+          {SMOKE_HIGHLIGHTS.map((h, i) => (
+            <HeroStat
+              key={h.label}
+              value={h.ratio ? <CountUp value={h.ratio} decimals={1} suffix="×" /> : '–'}
+              label={h.label}
+              sub={h.from !== null && h.to !== null ? `${h.from.toFixed(1)} → ${h.to.toFixed(1)} tok/s` : undefined}
+              accent={i === 0}
+            />
+          ))}
+        </div>
+        <p className="mt-3 flex flex-wrap items-center justify-between gap-2 font-mono text-[11px] text-fg-4">
+          <span>Small local smoke runs · Apple M2 (MPS) · Qwen2-0.5B fp16 · not headline GPU results</span>
+          <a href="#tested" className="text-fg-3 underline decoration-line-2 underline-offset-4 transition-colors hover:text-fg">
+            GPU benchmarks coming from Colab →
+          </a>
+        </p>
       </div>
     </section>
   );
 }
 
-function HeroStat({ value, unit, label, accent = false }: { value: React.ReactNode; unit?: string; label: string; accent?: boolean }) {
+function HeroStat({ value, label, sub, accent = false }: { value: React.ReactNode; label: string; sub?: string; accent?: boolean }) {
   return (
     <div className="bg-ink-950/80 px-5 py-6 backdrop-blur sm:px-6">
       <p className={`text-3xl font-semibold tracking-tight sm:text-[2.1rem] ${accent ? 'text-gradient' : 'text-fg'}`}>
         {value}
-        {unit && <span className="ml-1.5 text-sm font-normal text-fg-3">{unit}</span>}
       </p>
-      <p className="mt-1.5 text-[12.5px] leading-snug text-fg-3">{label}</p>
+      <p className="mt-1.5 text-[12.5px] leading-snug text-fg-2">{label}</p>
+      {sub && <p className="mt-1 font-mono text-[10.5px] text-fg-4">{sub}</p>}
     </div>
   );
 }

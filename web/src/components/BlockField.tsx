@@ -114,7 +114,8 @@ export function BlockField({ className = '' }: { className?: string }) {
     const frame = (now: number) => {
       ctx.setTransform(1, 0, 0, 1, 0, 0);
       ctx.clearRect(0, 0, canvas.width, canvas.height);
-      if (base) ctx.drawImage(base, 0, 0);
+      // A zero-size canvas (hidden tab/pane at load) can't be drawn; wait for the ResizeObserver.
+      if (base && base.width > 0 && base.height > 0) ctx.drawImage(base, 0, 0);
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
       // Ambient sequences
