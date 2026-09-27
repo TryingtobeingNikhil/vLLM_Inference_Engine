@@ -1,8 +1,11 @@
 'use client';
 
-import { useState } from 'react';
-import { SectionHeader } from '@/components/ui/SectionHeader';
+import { useLayoutEffect, useRef, useState } from 'react';
+import { SectionHeader, Accent } from '@/components/ui/SectionHeader';
 import { Badge } from '@/components/ui/Badge';
+import { Card } from '@/components/ui/Card';
+import { Reveal } from '@/components/ui/Reveal';
+import { CodeBlock, CopyButton } from '@/components/ui/CodeBlock';
 import { ENGINE_CONFIG } from '@/data/benchmarks';
 
 // ── Tab definitions ────────────────────────────────────────────────────────────
@@ -10,7 +13,8 @@ import { ENGINE_CONFIG } from '@/data/benchmarks';
 interface Tab {
   id: string;
   label: string;
-  lang: string;
+  lang: 'bash' | 'python' | 'typescript';
+  file: string;
   code: string;
 }
 
@@ -19,6 +23,7 @@ const TABS: Tab[] = [
     id: 'curl',
     label: 'cURL',
     lang: 'bash',
+    file: 'generate.sh',
     code: `# POST /generate — single request
 curl -s -X POST http://localhost:8000/generate \\
   -H "Content-Type: application/json" \\
@@ -41,6 +46,7 @@ curl -s -X POST http://localhost:8000/generate \\
     id: 'python',
     label: 'Python',
     lang: 'python',
+    file: 'client.py',
     code: `import asyncio, aiohttp
 
 async def generate(prompt: str, max_new_tokens: int = 64) -> dict:
@@ -68,6 +74,7 @@ asyncio.run(main())`,
     id: 'typescript',
     label: 'TypeScript',
     lang: 'typescript',
+    file: 'client.ts',
     code: `interface GenerateRequest {
   prompt: string;
   max_new_tokens?: number;
@@ -104,6 +111,7 @@ console.log(results.map((r) => \`\${r.ttft_ms.toFixed(1)} ms TTFT\`));`,
     id: 'health',
     label: 'Health',
     lang: 'bash',
+    file: 'health.sh',
     code: `# GET /health — liveness probe
 curl http://localhost:8000/health
 
@@ -140,118 +148,137 @@ const CONFIG_ROWS: { key: string; value: string | number; note: string }[] = [
   { key: 'decode_batch_limit',    value: ENGINE_CONFIG.decode_batch_limit,    note: 'Max decode seqs per iter' },
 ];
 
+const QUICK_START = `git clone https://github.com/TryingtobeingNikhil/vLLM_Inference_Engine
+cd vLLM_Inference_Engine
+pip install -r requirements.txt
+python -m uvicorn inference_engine.server.app:app --port 8000`;
+
+const ENDPOINTS = [
+  { method: 'POST', path: '/generate', color: '#60A5FA', note: 'Inference' },
+  { method: 'GET',  path: '/health',   color: '#4ADE80', note: 'Liveness' },
+  { method: 'GET',  path: '/metrics',  color: '#A78BFA', note: 'Prometheus' },
+];
+
 // ── Component ──────────────────────────────────────────────────────────────────
 
 export function APICodeSection() {
   const [activeTab, setActiveTab] = useState<string>('curl');
+  const tabRefs = useRef<Record<string, HTMLButtonElement | null>>({});
+  const [underline, setUnderline] = useState({ left: 0, width: 0 });
 
   const tab = TABS.find((t) => t.id === activeTab) ?? TABS[0];
 
+  useLayoutEffect(() => {
+    const el = tabRefs.current[activeTab];
+    if (el) setUnderline({ left: el.offsetLeft, width: el.offsetWidth });
+  }, [activeTab]);
+
   return (
-    <section id="api" className="border-b border-[#1e1e1e] px-6 py-20 sm:px-10 lg:px-16">
+    <section id="api" className="relative px-5 py-24 sm:px-6 sm:py-32">
       <div className="mx-auto max-w-5xl">
         <SectionHeader
-          label="// http api"
-          title="HTTP API"
+          index="07"
+          label="HTTP API"
+          title={<>Talk to it over <Accent gradient>plain HTTP.</Accent></>}
           subtitle={`POST /generate · GET /health · GET /metrics — serving ${ENGINE_CONFIG.model_name} on port 8000.`}
         />
 
-        <div className="grid gap-6 lg:grid-cols-[1fr_280px]">
-          {/* ── Code panel ───────────────────────────────────────────── */}
-          <div className="border border-[#2a2a2a] bg-[#0d0d0d]">
-            {/* Tab bar */}
-            <div className="flex items-center justify-between border-b border-[#1e1e1e]">
-              <div className="flex">
-                {TABS.map((t) => (
-                  <button
-                    key={t.id}
-                    onClick={() => setActiveTab(t.id)}
-                    className={`px-4 py-2.5 font-mono text-[11px] uppercase tracking-widest transition-colors ${
-                      t.id === activeTab
-                        ? 'border-b border-[#e8e8e8] text-[#e8e8e8]'
-                        : 'text-[#444444] hover:text-[#666666]'
-                    }`}
-                  >
-                    {t.label}
-                  </button>
-                ))}
-              </div>
-              <div className="px-3">
-                <Badge label="Demo Data" variant="demo" />
-              </div>
-            </div>
-
-            {/* Code body */}
-            <pre className="overflow-x-auto p-5 font-mono text-[11px] leading-relaxed text-[#888888]">
-              <code>{tab.code}</code>
-            </pre>
-          </div>
-
-          {/* ── Config sidebar ────────────────────────────────────────── */}
-          <div className="flex flex-col gap-4">
-            {/* Server info */}
-            <div className="border border-[#2a2a2a] bg-[#0d0d0d]">
-              <div className="border-b border-[#1e1e1e] px-3 py-2">
-                <span className="font-mono text-[10px] uppercase tracking-widest text-[#333333]">
-                  Server Endpoints
-                </span>
-              </div>
-              <div className="divide-y divide-[#1a1a1a] px-3">
-                {[
-                  { method: 'POST', path: '/generate', color: '#60A5FA', note: 'Inference' },
-                  { method: 'GET',  path: '/health',   color: '#4ADE80', note: 'Liveness' },
-                  { method: 'GET',  path: '/metrics',  color: '#a78bfa', note: 'Prometheus' },
-                ].map((ep) => (
-                  <div key={ep.path} className="flex items-center gap-2 py-2">
-                    <span
-                      className="w-10 font-mono text-[9px] uppercase"
-                      style={{ color: ep.color }}
+        <div className="grid gap-5 lg:grid-cols-[1fr_300px] [&>*]:min-w-0">
+          {/* Code window */}
+          <Reveal>
+            <div className="overflow-hidden rounded-2xl border border-line-2 bg-ink-900 shadow-[0_30px_80px_-30px_rgba(0,0,0,0.8)]">
+              <div className="flex items-center gap-3 border-b border-line bg-white/[0.015] pl-4 pr-3">
+                <div className="flex gap-1.5" aria-hidden="true">
+                  <span className="h-2.5 w-2.5 rounded-full bg-[#ff5f57]/80" />
+                  <span className="h-2.5 w-2.5 rounded-full bg-[#febc2e]/80" />
+                  <span className="h-2.5 w-2.5 rounded-full bg-[#28c840]/80" />
+                </div>
+                <div className="relative flex overflow-x-auto" role="tablist">
+                  {TABS.map((t) => (
+                    <button
+                      key={t.id}
+                      ref={(el) => { tabRefs.current[t.id] = el; }}
+                      role="tab"
+                      aria-selected={t.id === activeTab}
+                      onClick={() => setActiveTab(t.id)}
+                      className={`whitespace-nowrap px-3 py-3 font-mono text-[11.5px] transition-colors duration-300 ${
+                        t.id === activeTab ? 'text-fg' : 'text-fg-3 hover:text-fg-2'
+                      }`}
                     >
-                      {ep.method}
-                    </span>
-                    <code className="flex-1 font-mono text-[10px] text-[#888888]">
-                      {ep.path}
-                    </code>
-                    <span className="font-mono text-[9px] text-[#333333]">{ep.note}</span>
-                  </div>
-                ))}
+                      {t.label}
+                    </button>
+                  ))}
+                  <span
+                    className="absolute bottom-0 h-[2px] rounded-full bg-gradient-to-r from-mint to-cyan transition-all duration-500 [transition-timing-function:var(--ease-spring)]"
+                    style={{ left: underline.left + 10, width: Math.max(0, underline.width - 20) }}
+                  />
+                </div>
+                <div className="ml-auto flex items-center gap-2">
+                  <Badge label="Demo data" variant="demo" className="hidden md:inline-flex" />
+                  <CopyButton text={tab.code} />
+                </div>
+              </div>
+              <div className="flex items-center justify-between border-b border-line px-5 py-2 font-mono text-[10.5px] text-fg-4">
+                <span>{tab.file}</span>
+                <span>{tab.lang}</span>
+              </div>
+              <div key={tab.id} className="[animation:log-in_0.35s_var(--ease-out)_both]">
+                <CodeBlock code={tab.code} language={tab.lang} lineNumbers />
               </div>
             </div>
+          </Reveal>
 
-            {/* Engine config */}
-            <div className="border border-[#2a2a2a] bg-[#0d0d0d]">
-              <div className="border-b border-[#1e1e1e] px-3 py-2">
-                <span className="font-mono text-[10px] uppercase tracking-widest text-[#333333]">
-                  Engine Config
-                </span>
-              </div>
-              <div className="divide-y divide-[#1a1a1a]">
-                {CONFIG_ROWS.map((row) => (
-                  <div key={row.key} className="px-3 py-1.5">
-                    <div className="flex items-baseline justify-between">
-                      <code className="font-mono text-[9px] text-[#555555]">{row.key}</code>
-                      <span className="font-mono text-[10px] text-[#888888]">
-                        {row.value}
+          {/* Sidebar */}
+          <div className="flex flex-col gap-4">
+            <Reveal delay={80}>
+              <Card pad={false} glow={false}>
+                <p className="border-b border-line px-4 py-3 font-mono text-[10.5px] uppercase tracking-[0.16em] text-fg-3">Endpoints</p>
+                <ul className="p-2">
+                  {ENDPOINTS.map((ep) => (
+                    <li key={ep.path} className="flex items-center gap-3 rounded-xl px-2 py-2 transition-colors hover:bg-white/[0.03]">
+                      <span
+                        className="w-12 rounded-md py-0.5 text-center font-mono text-[9.5px] font-semibold"
+                        style={{ color: ep.color, backgroundColor: `${ep.color}16` }}
+                      >
+                        {ep.method}
                       </span>
-                    </div>
-                    <p className="mt-0.5 font-mono text-[9px] text-[#333333]">{row.note}</p>
-                  </div>
-                ))}
-              </div>
-            </div>
+                      <code className="flex-1 font-mono text-[12px] text-fg">{ep.path}</code>
+                      <span className="text-[11.5px] text-fg-4">{ep.note}</span>
+                    </li>
+                  ))}
+                </ul>
+              </Card>
+            </Reveal>
 
-            {/* Quick start */}
-            <div className="border border-[#2a2a2a] bg-[#0d0d0d] px-3 py-3">
-              <p className="mb-2 font-mono text-[10px] uppercase tracking-widest text-[#333333]">
-                Quick Start
-              </p>
-              <pre className="font-mono text-[10px] leading-relaxed text-[#555555]">
-                {`git clone …/vLLM_Inference_Engine
-cd PageServe
-pip install -r requirements.txt
-python -m inference_engine.server`}
-              </pre>
-            </div>
+            <Reveal delay={140}>
+              <Card pad={false} glow={false}>
+                <p className="border-b border-line px-4 py-3 font-mono text-[10.5px] uppercase tracking-[0.16em] text-fg-3">Engine config</p>
+                <dl className="divide-y divide-line">
+                  {CONFIG_ROWS.map((row) => (
+                    <div key={row.key} className="group px-4 py-2" title={row.note}>
+                      <div className="flex items-baseline justify-between gap-3">
+                        <dt className="font-mono text-[11px] text-fg-3 transition-colors group-hover:text-fg-2">{row.key}</dt>
+                        <dd className="truncate font-mono text-[11.5px] text-fg">{row.value}</dd>
+                      </div>
+                    </div>
+                  ))}
+                </dl>
+              </Card>
+            </Reveal>
+
+            <Reveal delay={200}>
+              <Card pad={false} glow={false}>
+                <div className="flex items-center justify-between border-b border-line px-4 py-2.5">
+                  <p className="font-mono text-[10.5px] uppercase tracking-[0.16em] text-fg-3">Quick start</p>
+                  <CopyButton text={QUICK_START} />
+                </div>
+                <pre className="overflow-x-auto px-4 py-3 font-mono text-[11px] leading-[1.9] text-fg-2">
+                  {QUICK_START.split('\n').map((l) => (
+                    <div key={l} className="whitespace-pre-wrap break-all pl-3.5 -indent-3.5"><span className="select-none text-mint">$ </span>{l.replace('https://github.com/TryingtobeingNikhil/', '…/')}</div>
+                  ))}
+                </pre>
+              </Card>
+            </Reveal>
           </div>
         </div>
       </div>

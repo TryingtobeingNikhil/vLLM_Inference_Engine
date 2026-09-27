@@ -1,15 +1,15 @@
-import { GitHubStats } from '@/components/GitHubStats';
+import { GitHubStats, StarButton, REPO_URL } from '@/components/GitHubStats';
+import { LogoMark } from '@/components/Nav';
+import { Reveal } from '@/components/ui/Reveal';
 
 export function GitHubFooter() {
-  const REPO_URL = 'https://github.com/TryingtobeingNikhil/vLLM_Inference_Engine';
-
   const LINKS = [
-    { label: 'Source',         href: REPO_URL },
-    { label: 'Issues',         href: `${REPO_URL}/issues` },
-    { label: 'bench_direct',   href: `${REPO_URL}/blob/main/bench_direct_results.json` },
-    { label: 'bench_phases',   href: `${REPO_URL}/blob/main/bench_phases_results.json` },
+    { label: 'Source',           href: REPO_URL },
+    { label: 'Issues',           href: `${REPO_URL}/issues` },
+    { label: 'README',           href: `${REPO_URL}/blob/main/README.md` },
+    { label: 'bench_direct',     href: `${REPO_URL}/blob/main/bench_direct_results.json` },
+    { label: 'bench_phases',     href: `${REPO_URL}/blob/main/bench_phases_results.json` },
     { label: 'baseline_metrics', href: `${REPO_URL}/blob/main/baseline_metrics.json` },
-    { label: 'README',         href: `${REPO_URL}/blob/main/README.md` },
   ];
 
   const TECH_STACK = [
@@ -23,93 +23,84 @@ export function GitHubFooter() {
   ];
 
   return (
-    <footer className="border-t border-[#1e1e1e] px-6 py-16 sm:px-10 lg:px-16">
-      <div className="mx-auto max-w-5xl">
-        {/* Top row */}
-        <div className="mb-10 grid gap-8 sm:grid-cols-[1fr_auto]">
-          {/* Left — project identity */}
-          <div>
-            <div className="mb-1 flex items-baseline gap-3">
-              <span className="font-mono text-xl font-semibold text-[#e8e8e8]">PageServe</span>
-              <span className="font-mono text-[10px] uppercase tracking-widest text-[#333333]">
-                v0.1.0
-              </span>
-            </div>
-            <p className="mb-4 max-w-md font-mono text-xs leading-relaxed text-[#444444]">
-              An LLM inference engine built from first principles — continuous batching, paged KV
-              cache, chunked prefill and CPU swap pool, implemented without vLLM or HuggingFace
-              generate.
-            </p>
+    <footer className="relative overflow-hidden border-t border-line px-5 pb-10 pt-24 sm:px-6">
+      <div className="pointer-events-none absolute bottom-[-20rem] left-1/2 h-[34rem] w-[70rem] -translate-x-1/2 rounded-full bg-[radial-gradient(closest-side,rgba(74,222,128,0.10),transparent)] blur-2xl" />
 
-            {/* Tech stack pills */}
-            <div className="flex flex-wrap gap-2">
+      <div className="relative mx-auto max-w-5xl">
+        {/* Closing CTA */}
+        <Reveal className="mb-20 text-center">
+          <p className="accent-serif text-2xl text-fg-3 sm:text-3xl">Curious how it works under the hood?</p>
+          <h2 className="mt-2 text-balance text-4xl font-semibold tracking-tight text-fg sm:text-5xl">
+            Read the source. <span className="text-gradient">Break the scheduler.</span>
+          </h2>
+          <div className="mt-8 flex flex-col items-center gap-4">
+            <StarButton label="Star PageServe on GitHub" />
+            <GitHubStats className="justify-center" />
+          </div>
+        </Reveal>
+
+        <div className="grid gap-10 border-t border-line pt-10 sm:grid-cols-[1.3fr_1fr]">
+          <div>
+            <div className="mb-3 flex items-center gap-2.5">
+              <LogoMark className="h-6 w-6" />
+              <span className="text-lg font-semibold tracking-tight text-fg">PageServe</span>
+              <span className="rounded-full border border-line-2 px-2 py-0.5 font-mono text-[10px] text-fg-3">v0.1.0</span>
+            </div>
+            <p className="mb-5 max-w-md text-[13.5px] leading-relaxed text-fg-3">
+              An LLM inference engine built from first principles — continuous batching, paged KV cache, chunked
+              prefill and CPU swap pool, implemented without vLLM or HuggingFace generate.
+            </p>
+            <div className="flex flex-wrap gap-1.5">
               {TECH_STACK.map((t) => (
-                <span
-                  key={t}
-                  className="border border-[#1e1e1e] px-2 py-0.5 font-mono text-[10px] text-[#333333]"
-                >
+                <span key={t} className="rounded-full border border-line px-2.5 py-1 font-mono text-[10.5px] text-fg-3">
                   {t}
                 </span>
               ))}
             </div>
           </div>
 
-          {/* Right — CTA */}
-          <div className="flex flex-col items-start gap-3 sm:items-end">
-            <a
-              href={REPO_URL}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="inline-flex items-center gap-2 border border-[#e8e8e8] px-5 py-2.5 font-mono text-sm text-[#e8e8e8] transition-colors hover:bg-[#e8e8e8] hover:text-[#0a0a0a]"
-            >
-              {/* GitHub icon (inline SVG, no external dep) */}
-              <svg
-                viewBox="0 0 24 24"
-                fill="currentColor"
-                className="h-4 w-4"
-                aria-hidden="true"
-              >
-                <path d="M12 0C5.37 0 0 5.37 0 12c0 5.3 3.44 9.8 8.2 11.38.6.1.82-.26.82-.58v-2.03c-3.34.72-4.04-1.6-4.04-1.6-.55-1.39-1.34-1.76-1.34-1.76-1.09-.74.08-.73.08-.73 1.2.09 1.84 1.24 1.84 1.24 1.07 1.83 2.8 1.3 3.49 1 .1-.78.42-1.3.76-1.6-2.67-.3-5.47-1.33-5.47-5.93 0-1.31.47-2.38 1.24-3.22-.13-.3-.54-1.52.12-3.18 0 0 1.01-.32 3.3 1.23a11.5 11.5 0 0 1 3-.4c1.02.01 2.04.14 3 .4 2.3-1.55 3.3-1.23 3.3-1.23.66 1.66.25 2.88.12 3.18.77.84 1.24 1.91 1.24 3.22 0 4.61-2.81 5.63-5.48 5.92.43.37.81 1.1.81 2.22v3.29c0 .32.22.69.82.57C20.56 21.8 24 17.3 24 12c0-6.63-5.37-12-12-12z" />
-              </svg>
-              View on GitHub
-            </a>
-            <GitHubStats />
-            <span className="font-mono text-[10px] text-[#333333]">
-              TryingtobeingNikhil / vLLM_Inference_Engine
-            </span>
+          <div>
+            <p className="mb-3 font-mono text-[10.5px] uppercase tracking-[0.16em] text-fg-4">Explore</p>
+            <ul className="grid grid-cols-2 gap-x-6 gap-y-2">
+              {LINKS.map((link) => (
+                <li key={link.label}>
+                  <a
+                    href={link.href}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="group inline-flex items-center gap-1 font-mono text-[12px] text-fg-3 transition-colors hover:text-fg"
+                  >
+                    {link.label}
+                    <span className="translate-y-px opacity-0 transition-all duration-300 group-hover:translate-x-0.5 group-hover:opacity-100">↗</span>
+                  </a>
+                </li>
+              ))}
+            </ul>
           </div>
         </div>
 
-        {/* Divider */}
-        <div className="mb-8 border-t border-[#1a1a1a]" />
-
-        {/* Links row */}
-        <div className="mb-8 flex flex-wrap gap-x-6 gap-y-2">
-          {LINKS.map((link) => (
-            <a
-              key={link.label}
-              href={link.href}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="font-mono text-[11px] text-[#444444] transition-colors hover:text-[#888888]"
-            >
-              {link.label}
-            </a>
-          ))}
+        {/* Oversized wordmark */}
+        <div className="pointer-events-none mt-16 select-none overflow-hidden" aria-hidden="true">
+          <p
+            className="text-center text-[18vw] font-semibold leading-[0.8] tracking-[-0.06em] text-transparent lg:text-[11.5rem]"
+            style={{
+              WebkitTextStroke: '1px rgba(255,255,255,0.09)',
+              backgroundImage: 'linear-gradient(180deg, rgba(255,255,255,0.06), transparent 75%)',
+              WebkitBackgroundClip: 'text',
+              backgroundClip: 'text',
+            }}
+          >
+            PageServe
+          </p>
         </div>
 
-        {/* Bottom bar */}
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <span className="font-mono text-[10px] text-[#2a2a2a]">
-            Hardware: Apple M2 · Qwen/Qwen2-0.5B · float16 · MPS
-          </span>
+        <div className="mt-8 flex flex-wrap items-center justify-between gap-3 border-t border-line pt-6 font-mono text-[10.5px] text-fg-4">
+          <span>Apple M2 · Qwen/Qwen2-0.5B · float16 · MPS — all benchmarks measured on real hardware</span>
           <div className="flex items-center gap-4">
-            <span className="font-mono text-[10px] text-[#2a2a2a]">
-              All benchmark data measured on real hardware
-            </span>
-            <span className="font-mono text-[10px] text-[#2a2a2a]">
-              © {new Date().getFullYear()} PageServe
-            </span>
+            <span>© {new Date().getFullYear()} PageServe</span>
+            <a href="#top" className="rounded-full border border-line px-2.5 py-1 text-fg-3 transition-colors hover:border-line-2 hover:text-fg">
+              ↑ Top
+            </a>
           </div>
         </div>
       </div>
