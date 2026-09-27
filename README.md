@@ -135,7 +135,7 @@ Each sequence tracks `num_computed_tokens` — how many of its tokens already ha
 
 The runner concatenates every scheduled token into a single `[1, T]` batch with explicit `position_ids` — no padding flows through the MLPs. HuggingFace models dispatch attention through a registry, so PageServe registers its own backend ([`attention_wrapper.py`](inference_engine/engine/attention_wrapper.py)). Each layer hands it the new keys/values; it scatters them into the pool at each token's *slot* (`block_table[pos // 16] * 16 + pos % 16`) and attends each query to its sequence's context through the block table:
 
-* **short queries** (decode, speculative verification): all sequences batched — gather contexts, masked attention with two matmuls, GQA handled by grouping query heads;
+* **short queries** (decode, speculative verification): all sequences batched — gather contexts, one masked SDPA call (fp32 accumulation), GQA handled by folding query heads into the query axis;
 * **long queries** (prefill chunks): one fused `scaled_dot_product_attention` per sequence.
 
 It's a readable reference in plain PyTorch; production engines swap step 2 for a fused kernel (PagedAttention / FlashInfer) that reads the pool in place.
