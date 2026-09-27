@@ -1,0 +1,764 @@
+{
+  "system": {
+    "timestamp": "2026-09-27 18:58:37",
+    "python": "3.13.15",
+    "torch": "2.11.0+cu128",
+    "transformers": "5.16.1",
+    "platform": "Linux-6.6.122+-x86_64-with-glibc2.39",
+    "device": "cuda",
+    "gpu": "Tesla T4",
+    "gpu_memory_gb": 14.6,
+    "cuda": "12.8",
+    "compute_capability": "7.5",
+    "git_commit": "f168063",
+    "model": "Qwen/Qwen2.5-1.5B-Instruct"
+  },
+  "args": {
+    "model": "auto",
+    "draft_model": "auto",
+    "suites": "batching,prefix,spec",
+    "num_requests": 128,
+    "sequential_requests": 12,
+    "input_len": [
+      256,
+      512
+    ],
+    "output_len": [
+      128,
+      256
+    ],
+    "max_batch_size": 0,
+    "static_batch_size": 32,
+    "seed": 0,
+    "output_dir": "results",
+    "quick": false
+  },
+  "runs": [
+    {
+      "suite": "batching",
+      "workload": "random",
+      "system": "hf_sequential",
+      "metrics": {
+        "num_requests": 12,
+        "wall_s": 84.3251916910001,
+        "input_tokens": 4774,
+        "output_tokens": 2323,
+        "output_tok_s": 27.548114073815146,
+        "total_tok_s": 84.16227532581408,
+        "req_s": 0.14230622853455951,
+        "ttft_ms": {
+          "p50": 36.42489800000703,
+          "p90": 67.83240939998906,
+          "p95": 335.09609064999455,
+          "p99": 594.2798141299958,
+          "mean": 92.65455341666022
+        },
+        "tpot_ms": {
+          "p50": 33.25013474148034,
+          "p90": 35.97832089666477,
+          "p95": 36.37464843511287,
+          "p99": 36.66575259257466,
+          "mean": 33.59425758241041
+        },
+        "itl_ms": {
+          "p50": 31.03131700004269,
+          "p90": 41.60516499996447,
+          "p95": 46.168828500015024,
+          "p99": 52.61330169997792,
+          "mean": 33.38246663132706
+        },
+        "e2e_ms": {
+          "p50": 7246.399714500001,
+          "p90": 8371.39263269994,
+          "p95": 8521.240031649984,
+          "p99": 8654.360991930023,
+          "mean": 7024.929070416657
+        },
+        "peak_gpu_mem_mb": 4047.2509765625,
+        "gpu": {
+          "available": true,
+          "gpu_name": "Tesla T4",
+          "num_samples": 418,
+          "util_mean_pct": 54.399521531100476,
+          "util_p50_pct": 57.0,
+          "util_max_pct": 82.0,
+          "mem_used_max_mb": 4660.1875,
+          "mem_total_mb": 15360.0
+        },
+        "note": "requests run back-to-back; TTFT/E2E exclude time spent waiting for earlier requests"
+      }
+    },
+    {
+      "suite": "batching",
+      "workload": "random",
+      "system": "hf_static_batch",
+      "metrics": {
+        "num_requests": 128,
+        "wall_s": 86.67421134100005,
+        "input_tokens": 48072,
+        "output_tokens": 23976,
+        "output_tok_s": 276.62207280631446,
+        "total_tok_s": 831.2507132778338,
+        "req_s": 1.4767945161498268,
+        "batch_size": 32,
+        "peak_gpu_mem_mb": 5383.53857421875,
+        "gpu": {
+          "available": true,
+          "gpu_name": "Tesla T4",
+          "num_samples": 428,
+          "util_mean_pct": 97.53504672897196,
+          "util_p50_pct": 98.0,
+          "util_max_pct": 100.0,
+          "mem_used_max_mb": 6060.1875,
+          "mem_total_mb": 15360.0
+        }
+      }
+    },
+    {
+      "suite": "batching",
+      "workload": "random",
+      "system": "engine_no_batching",
+      "metrics": {
+        "num_requests": 12,
+        "wall_s": 92.34152226100002,
+        "input_tokens": 4774,
+        "output_tokens": 2323,
+        "output_tok_s": 25.156613656791613,
+        "total_tok_s": 76.85599962214812,
+        "req_s": 0.1299523736037449,
+        "ttft_ms": {
+          "p50": 39005.44247149998,
+          "p90": 73953.10474959997,
+          "p95": 78495.18168029997,
+          "p99": 82175.73201925999,
+          "mean": 40917.51809774998
+        },
+        "tpot_ms": {
+          "p50": 39.8169580365173,
+          "p90": 41.39596231462111,
+          "p95": 42.08798121972964,
+          "p99": 42.73817557431585,
+          "mean": 39.69754311725575
+        },
+        "itl_ms": {
+          "p50": 36.953401000005215,
+          "p90": 49.167130000000725,
+          "p95": 53.62054100004343,
+          "p99": 61.492691200010114,
+          "mean": 39.62550139247079
+        },
+        "e2e_ms": {
+          "p50": 46713.431993500024,
+          "p90": 82194.78443789999,
+          "p95": 87198.24590229997,
+          "p99": 91273.15223405999,
+          "mean": 48548.806142833324
+        },
+        "peak_gpu_mem_mb": 12065.95068359375,
+        "gpu": {
+          "available": true,
+          "gpu_name": "Tesla T4",
+          "num_samples": 458,
+          "util_mean_pct": 45.47379912663755,
+          "util_p50_pct": 47.0,
+          "util_max_pct": 69.0,
+          "mem_used_max_mb": 12680.1875,
+          "mem_total_mb": 15360.0
+        },
+        "kv_blocks": 18585,
+        "kv_pool_mb": 8130.9375,
+        "max_batch_size": 1,
+        "prefix_cache_hit_rate": 0.0,
+        "cached_prompt_tokens": 0,
+        "spec_acceptance_rate": null,
+        "preemptions": 0,
+        "num_failed": 0,
+        "finish_reasons": [
+          "length"
+        ]
+      }
+    },
+    {
+      "suite": "batching",
+      "workload": "random",
+      "system": "engine",
+      "metrics": {
+        "num_requests": 128,
+        "wall_s": 30.74154817300007,
+        "input_tokens": 48072,
+        "output_tokens": 23976,
+        "output_tok_s": 779.9216833541855,
+        "total_tok_s": 2343.668561991256,
+        "req_s": 4.163746057279602,
+        "ttft_ms": {
+          "p50": 7543.879352499971,
+          "p90": 18133.94914160001,
+          "p95": 18898.754115749976,
+          "p99": 19657.766227800006,
+          "mean": 8844.47185759374
+        },
+        "tpot_ms": {
+          "p50": 63.7807139031056,
+          "p90": 75.53674772065425,
+          "p95": 76.68292129890752,
+          "p99": 78.39073123773692,
+          "mean": 62.43099553017093
+        },
+        "itl_ms": {
+          "p50": 47.038809000014226,
+          "p90": 96.9392260000177,
+          "p95": 132.92575499997383,
+          "p99": 366.5931369999953,
+          "mean": 62.34156100624791
+        },
+        "e2e_ms": {
+          "p50": 20500.84730650002,
+          "p90": 27308.502319599986,
+          "p95": 28938.79378059998,
+          "p99": 29921.42370860995,
+          "mean": 20459.975865624998
+        },
+        "peak_gpu_mem_mb": 12144.05859375,
+        "gpu": {
+          "available": true,
+          "gpu_name": "Tesla T4",
+          "num_samples": 152,
+          "util_mean_pct": 81.22368421052632,
+          "util_p50_pct": 87.0,
+          "util_max_pct": 100.0,
+          "mem_used_max_mb": 12780.1875,
+          "mem_total_mb": 15360.0
+        },
+        "kv_blocks": 18527,
+        "kv_pool_mb": 8105.5625,
+        "max_batch_size": 64,
+        "prefix_cache_hit_rate": 0.0,
+        "cached_prompt_tokens": 0,
+        "spec_acceptance_rate": null,
+        "preemptions": 0,
+        "num_failed": 0,
+        "finish_reasons": [
+          "length"
+        ]
+      }
+    },
+    {
+      "suite": "prefix",
+      "workload": "shared_prefix",
+      "system": "engine",
+      "metrics": {
+        "num_requests": 128,
+        "wall_s": 52.33509969599993,
+        "input_tokens": 138533,
+        "output_tokens": 24317,
+        "output_tok_s": 464.6403683426745,
+        "total_tok_s": 3111.6784136449623,
+        "req_s": 2.445777322361407,
+        "ttft_ms": {
+          "p50": 16641.272909500003,
+          "p90": 36002.53268339999,
+          "p95": 38146.854244099966,
+          "p99": 39055.71416567997,
+          "mean": 18642.459093929683
+        },
+        "tpot_ms": {
+          "p50": 107.61011948390532,
+          "p90": 132.59186566211392,
+          "p95": 134.91328758335015,
+          "p99": 137.53350110312766,
+          "mean": 103.86675317327828
+        },
+        "itl_ms": {
+          "p50": 60.71835199998077,
+          "p90": 242.0381780000298,
+          "p95": 336.6602390000253,
+          "p99": 412.0709309999029,
+          "mean": 103.96879052759523
+        },
+        "e2e_ms": {
+          "p50": 40304.73444450002,
+          "p90": 49164.424796900006,
+          "p95": 50085.984299350035,
+          "p99": 51463.06599419001,
+          "mean": 38290.803736109374
+        },
+        "peak_gpu_mem_mb": 12144.51513671875,
+        "gpu": {
+          "available": true,
+          "gpu_name": "Tesla T4",
+          "num_samples": 259,
+          "util_mean_pct": 90.74131274131274,
+          "util_p50_pct": 94.0,
+          "util_max_pct": 100.0,
+          "mem_used_max_mb": 12776.1875,
+          "mem_total_mb": 15360.0
+        },
+        "kv_blocks": 18527,
+        "kv_pool_mb": 8105.5625,
+        "max_batch_size": 64,
+        "prefix_cache_hit_rate": 0.0,
+        "cached_prompt_tokens": 0,
+        "spec_acceptance_rate": null,
+        "preemptions": 0,
+        "num_failed": 0,
+        "finish_reasons": [
+          "length"
+        ]
+      }
+    },
+    {
+      "suite": "prefix",
+      "workload": "shared_prefix",
+      "system": "engine+prefix",
+      "metrics": {
+        "num_requests": 128,
+        "wall_s": 27.478673483999955,
+        "input_tokens": 138533,
+        "output_tokens": 24317,
+        "output_tok_s": 884.94082562461,
+        "total_tok_s": 5926.4141733342,
+        "req_s": 4.658157901054821,
+        "ttft_ms": {
+          "p50": 4733.328593999943,
+          "p90": 14383.519532500031,
+          "p95": 14681.958734050046,
+          "p99": 15243.60253384002,
+          "mean": 6579.214481429704
+        },
+        "tpot_ms": {
+          "p50": 58.66673211051716,
+          "p90": 60.17321967826754,
+          "p95": 60.33307114709326,
+          "p99": 60.63330934187347,
+          "mean": 57.47696612509147
+        },
+        "itl_ms": {
+          "p50": 55.25909799996498,
+          "p90": 68.11115099992548,
+          "p95": 72.59335499998087,
+          "p99": 87.39356400008091,
+          "mean": 57.379145519740305
+        },
+        "e2e_ms": {
+          "p50": 16795.657401499968,
+          "p90": 24411.255291399968,
+          "p95": 25290.534211049962,
+          "p99": 26583.59136928001,
+          "mean": 17423.16033803125
+        },
+        "peak_gpu_mem_mb": 12140.62548828125,
+        "gpu": {
+          "available": true,
+          "gpu_name": "Tesla T4",
+          "num_samples": 136,
+          "util_mean_pct": 82.81617647058823,
+          "util_p50_pct": 87.5,
+          "util_max_pct": 100.0,
+          "mem_used_max_mb": 12758.1875,
+          "mem_total_mb": 15360.0
+        },
+        "kv_blocks": 18527,
+        "kv_pool_mb": 8105.5625,
+        "max_batch_size": 64,
+        "prefix_cache_hit_rate": 0.9276299643419134,
+        "cached_prompt_tokens": 128512,
+        "spec_acceptance_rate": null,
+        "preemptions": 0,
+        "num_failed": 0,
+        "finish_reasons": [
+          "length"
+        ]
+      }
+    },
+    {
+      "suite": "spec",
+      "workload": "repetitive",
+      "system": "engine",
+      "metrics": {
+        "num_requests": 128,
+        "wall_s": 25.365309277999927,
+        "input_tokens": 27855,
+        "output_tokens": 23453,
+        "output_tok_s": 924.6092662604146,
+        "total_tok_s": 2022.762641593372,
+        "req_s": 5.046262144771802,
+        "ttft_ms": {
+          "p50": 2500.0452305000067,
+          "p90": 14206.04713369994,
+          "p95": 14755.974586600021,
+          "p99": 15123.597112109994,
+          "mean": 6654.6438266874975
+        },
+        "tpot_ms": {
+          "p50": 53.69464888621021,
+          "p90": 60.442161405587285,
+          "p95": 62.57731616017547,
+          "p99": 94.05911713992444,
+          "mean": 56.59704984424296
+        },
+        "itl_ms": {
+          "p50": 44.05246499993609,
+          "p90": 70.80243299992617,
+          "p95": 78.40545800013388,
+          "p99": 144.40982300016003,
+          "mean": 53.44563235579851
+        },
+        "e2e_ms": {
+          "p50": 15365.70913600002,
+          "p90": 23196.3818363001,
+          "p95": 24197.351776499967,
+          "p99": 24949.861189969975,
+          "mean": 16394.260346804687
+        },
+        "peak_gpu_mem_mb": 12143.59375,
+        "gpu": {
+          "available": true,
+          "gpu_name": "Tesla T4",
+          "num_samples": 126,
+          "util_mean_pct": 75.5079365079365,
+          "util_p50_pct": 77.0,
+          "util_max_pct": 100.0,
+          "mem_used_max_mb": 12780.1875,
+          "mem_total_mb": 15360.0
+        },
+        "kv_blocks": 18527,
+        "kv_pool_mb": 8105.5625,
+        "max_batch_size": 64,
+        "prefix_cache_hit_rate": 0.0,
+        "cached_prompt_tokens": 0,
+        "spec_acceptance_rate": null,
+        "preemptions": 0,
+        "num_failed": 0,
+        "finish_reasons": [
+          "eos",
+          "length"
+        ]
+      }
+    },
+    {
+      "suite": "spec",
+      "workload": "repetitive",
+      "system": "engine+ngram",
+      "metrics": {
+        "num_requests": 128,
+        "wall_s": 16.958902040999874,
+        "input_tokens": 27855,
+        "output_tokens": 23453,
+        "output_tok_s": 1382.9315095576342,
+        "total_tok_s": 3025.4317099041955,
+        "req_s": 7.547658432753899,
+        "ttft_ms": {
+          "p50": 2583.1185279998863,
+          "p90": 8563.666926599966,
+          "p95": 9627.305430650049,
+          "p99": 10327.811837779931,
+          "mean": 4340.542522804688
+        },
+        "tpot_ms": {
+          "p50": 26.475107925486615,
+          "p90": 47.39893701005284,
+          "p95": 60.118368855914966,
+          "p99": 129.80470867002865,
+          "mean": 32.86024964258405
+        },
+        "itl_ms": {
+          "p50": 89.55592400002388,
+          "p90": 178.15364400007638,
+          "p95": 213.57851799984928,
+          "p99": 383.4513970000444,
+          "mean": 106.91096458575372
+        },
+        "e2e_ms": {
+          "p50": 10302.609373999985,
+          "p90": 12259.04699239993,
+          "p95": 13203.716787349878,
+          "p99": 15815.566858970078,
+          "mean": 9488.808828328132
+        },
+        "peak_gpu_mem_mb": 12124.95947265625,
+        "gpu": {
+          "available": true,
+          "gpu_name": "Tesla T4",
+          "num_samples": 84,
+          "util_mean_pct": 76.80952380952381,
+          "util_p50_pct": 88.5,
+          "util_max_pct": 100.0,
+          "mem_used_max_mb": 12820.1875,
+          "mem_total_mb": 15360.0
+        },
+        "kv_blocks": 18180,
+        "kv_pool_mb": 7953.75,
+        "max_batch_size": 64,
+        "prefix_cache_hit_rate": 0.0,
+        "cached_prompt_tokens": 0,
+        "spec_acceptance_rate": 0.9255743716966885,
+        "preemptions": 0,
+        "num_failed": 0,
+        "finish_reasons": [
+          "eos",
+          "length"
+        ]
+      }
+    },
+    {
+      "suite": "spec",
+      "workload": "repetitive",
+      "system": "engine+draft",
+      "metrics": {
+        "num_requests": 128,
+        "wall_s": 30.096482215999913,
+        "input_tokens": 27855,
+        "output_tokens": 23453,
+        "output_tok_s": 779.2605073137717,
+        "total_tok_s": 1704.78395553895,
+        "req_s": 4.252988740722414,
+        "ttft_ms": {
+          "p50": 4032.750821499917,
+          "p90": 17250.152765700066,
+          "p95": 17554.125505700016,
+          "p99": 19133.670937039875,
+          "mean": 8302.968403671894
+        },
+        "tpot_ms": {
+          "p50": 59.52154369586966,
+          "p90": 75.14897625718191,
+          "p95": 84.16563320635409,
+          "p99": 409.60218014001197,
+          "mean": 71.76445032753418
+        },
+        "itl_ms": {
+          "p50": 262.59731200002534,
+          "p90": 378.1806049998977,
+          "p95": 462.25951600013104,
+          "p99": 596.0997930001213,
+          "mean": 274.9672859039655
+        },
+        "e2e_ms": {
+          "p50": 19649.04085500007,
+          "p90": 26492.873019499846,
+          "p95": 27789.832859049886,
+          "p99": 29066.962451509928,
+          "mean": 19354.082280992196
+        },
+        "peak_gpu_mem_mb": 12166.50146484375,
+        "gpu": {
+          "available": true,
+          "gpu_name": "Tesla T4",
+          "num_samples": 149,
+          "util_mean_pct": 64.14765100671141,
+          "util_p50_pct": 66.0,
+          "util_max_pct": 100.0,
+          "mem_used_max_mb": 12840.1875,
+          "mem_total_mb": 15360.0
+        },
+        "kv_blocks": 12770,
+        "kv_pool_mb": 5586.875,
+        "max_batch_size": 64,
+        "prefix_cache_hit_rate": 0.0,
+        "cached_prompt_tokens": 0,
+        "spec_acceptance_rate": 0.8953688665780797,
+        "preemptions": 0,
+        "num_failed": 0,
+        "finish_reasons": [
+          "eos",
+          "length"
+        ]
+      }
+    },
+    {
+      "suite": "spec",
+      "workload": "chat",
+      "system": "engine",
+      "metrics": {
+        "num_requests": 128,
+        "wall_s": 21.21167536300004,
+        "input_tokens": 1478,
+        "output_tokens": 22053,
+        "output_tok_s": 1039.6632808395466,
+        "total_tok_s": 1109.3418882435662,
+        "req_s": 6.03441254919793,
+        "ttft_ms": {
+          "p50": 3039.442225500011,
+          "p90": 9761.609612200004,
+          "p95": 10844.6107362999,
+          "p99": 11607.668025560033,
+          "mean": 4330.4253554453535
+        },
+        "tpot_ms": {
+          "p50": 46.53600340717492,
+          "p90": 47.59507932614612,
+          "p95": 47.72592284623526,
+          "p99": 48.37422233327017,
+          "mean": 46.31225749897507
+        },
+        "itl_ms": {
+          "p50": 42.75689299993246,
+          "p90": 57.44032999996307,
+          "p95": 61.809295999864844,
+          "p99": 67.92345999997451,
+          "mean": 46.23571426221184
+        },
+        "e2e_ms": {
+          "p50": 11690.031287500005,
+          "p90": 17910.90021,
+          "p95": 18598.1595304499,
+          "p99": 20232.871141849966,
+          "mean": 12250.582303421881
+        },
+        "peak_gpu_mem_mb": 12068.521484375,
+        "gpu": {
+          "available": true,
+          "gpu_name": "Tesla T4",
+          "num_samples": 105,
+          "util_mean_pct": 58.77142857142857,
+          "util_p50_pct": 62.0,
+          "util_max_pct": 80.0,
+          "mem_used_max_mb": 12676.1875,
+          "mem_total_mb": 15360.0
+        },
+        "kv_blocks": 18527,
+        "kv_pool_mb": 8105.5625,
+        "max_batch_size": 64,
+        "prefix_cache_hit_rate": 0.0,
+        "cached_prompt_tokens": 0,
+        "spec_acceptance_rate": null,
+        "preemptions": 0,
+        "num_failed": 0,
+        "finish_reasons": [
+          "eos",
+          "length"
+        ]
+      }
+    },
+    {
+      "suite": "spec",
+      "workload": "chat",
+      "system": "engine+ngram",
+      "metrics": {
+        "num_requests": 128,
+        "wall_s": 22.796293155000058,
+        "input_tokens": 1478,
+        "output_tokens": 22035,
+        "output_tok_s": 966.6045198741849,
+        "total_tok_s": 1031.4396222283508,
+        "req_s": 5.614947971132094,
+        "ttft_ms": {
+          "p50": 3052.6786184999537,
+          "p90": 9995.61258359995,
+          "p95": 11862.115537550028,
+          "p99": 12487.30499872001,
+          "mean": 4406.041862226525
+        },
+        "tpot_ms": {
+          "p50": 48.19454347777304,
+          "p90": 54.33473574615176,
+          "p95": 55.81053191412312,
+          "p99": 57.767585587720006,
+          "mean": 47.120897354371856
+        },
+        "itl_ms": {
+          "p50": 51.43297200015695,
+          "p90": 66.79516100007277,
+          "p95": 73.40054199994483,
+          "p99": 83.85222699985206,
+          "mean": 54.70815252471582
+        },
+        "e2e_ms": {
+          "p50": 12601.201592500047,
+          "p90": 18476.090775799847,
+          "p95": 19357.205401249983,
+          "p99": 21043.936411609953,
+          "mean": 12447.815186499998
+        },
+        "peak_gpu_mem_mb": 12065.359375,
+        "gpu": {
+          "available": true,
+          "gpu_name": "Tesla T4",
+          "num_samples": 113,
+          "util_mean_pct": 55.716814159292035,
+          "util_p50_pct": 54.0,
+          "util_max_pct": 81.0,
+          "mem_used_max_mb": 12778.1875,
+          "mem_total_mb": 15360.0
+        },
+        "kv_blocks": 18180,
+        "kv_pool_mb": 7953.75,
+        "max_batch_size": 64,
+        "prefix_cache_hit_rate": 0.0,
+        "cached_prompt_tokens": 0,
+        "spec_acceptance_rate": 0.2651521645949421,
+        "preemptions": 0,
+        "num_failed": 0,
+        "finish_reasons": [
+          "eos",
+          "length"
+        ]
+      }
+    },
+    {
+      "suite": "spec",
+      "workload": "chat",
+      "system": "engine+draft",
+      "metrics": {
+        "num_requests": 128,
+        "wall_s": 31.686215653999852,
+        "input_tokens": 1478,
+        "output_tokens": 22078,
+        "output_tok_s": 696.7698585745446,
+        "total_tok_s": 743.4147471954875,
+        "req_s": 4.03961146378937,
+        "ttft_ms": {
+          "p50": 3649.4323570000233,
+          "p90": 13842.84584459997,
+          "p95": 14952.023133299985,
+          "p99": 15925.065656909877,
+          "mean": 5877.803251390595
+        },
+        "tpot_ms": {
+          "p50": 61.29220797109845,
+          "p90": 73.05142295399308,
+          "p95": 77.39622494861491,
+          "p99": 81.66530559302568,
+          "mean": 62.10212995792843
+        },
+        "itl_ms": {
+          "p50": 207.09875600005034,
+          "p90": 249.48620500003926,
+          "p95": 265.6781670000328,
+          "p99": 278.3163980000154,
+          "mean": 211.69219054835793
+        },
+        "e2e_ms": {
+          "p50": 16644.394552999867,
+          "p90": 24368.78583830005,
+          "p95": 24951.251892750086,
+          "p99": 29033.10360144986,
+          "mean": 16600.38633336718
+        },
+        "peak_gpu_mem_mb": 12166.40478515625,
+        "gpu": {
+          "available": true,
+          "gpu_name": "Tesla T4",
+          "num_samples": 157,
+          "util_mean_pct": 48.64968152866242,
+          "util_p50_pct": 52.0,
+          "util_max_pct": 77.0,
+          "mem_used_max_mb": 12802.1875,
+          "mem_total_mb": 15360.0
+        },
+        "kv_blocks": 12770,
+        "kv_pool_mb": 5586.875,
+        "max_batch_size": 64,
+        "prefix_cache_hit_rate": 0.0,
+        "cached_prompt_tokens": 0,
+        "spec_acceptance_rate": 0.604542444193385,
+        "preemptions": 0,
+        "num_failed": 0,
+        "finish_reasons": [
+          "eos",
+          "length"
+        ]
+      }
+    }
+  ]
+}

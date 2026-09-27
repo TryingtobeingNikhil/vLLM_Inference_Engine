@@ -254,6 +254,16 @@ python run_load_test.py --server custom --url http://localhost:8000 --api openai
     --model Qwen/Qwen2.5-1.5B-Instruct --stream                             # e.g. vLLM
 ```
 
+### Published results
+
+Raw result files from real runs live in [`benchmarks/published/`](benchmarks/published) (JSON + Markdown + charts, each stamped with GPU, versions and git commit). The website reads a trimmed copy produced by:
+
+```bash
+python -m benchmarks.export_site_data benchmarks/published/T4_2026-09-27 web/src/data/results/t4.json
+```
+
+**NVIDIA T4 (Colab), Qwen2.5-1.5B-Instruct fp16** — offline: continuous batching **780 tok/s vs 27.5 for HF sequential (28×)** and 277 for HF static batching (2.8×); prefix caching **1.9×** on a shared 1k-token system prompt; n-gram speculation **1.5×** on copy-heavy output and no gain on free-form chat. Serving: capacity **3.7 req/s vs 0.14** for the sequential server, 100% of requests within SLO up to 4 req/s. fp16 accuracy matches HF's own (99.7% top-1 agreement with fp32).
+
 ### How the numbers are measured
 
 - **TTFT** — scheduled send time → first streamed token (includes queueing).
@@ -262,8 +272,6 @@ python run_load_test.py --server custom --url http://localhost:8000 --api openai
 - **E2E** — scheduled send time → last token.
 - Latency is measured from the *scheduled* send time, so a server that falls behind is charged for it (no coordinated omission). Batching and prefix-caching benchmarks use `ignore_eos` so every system generates the same number of tokens. Speculative-decoding benchmarks let outputs end at EOS instead: forcing generation past EOS makes models repeat themselves, which n-gram drafts predict almost perfectly and would overstate the speedup (greedy speculation is exact, so all configs still emit identical text).
 - **GPU utilisation** is NVML's "time a kernel was running" — a busy-ness signal, not FLOP efficiency.
-
-A local smoke run (Apple M2, MPS, Qwen2-0.5B, 16 requests) already shows the shape of the results: continuous batching **3.6×** HF sequential throughput, prefix caching **2×** on the shared-prefix workload. Real GPU numbers come from the Colab notebook.
 
 ---
 

@@ -8,7 +8,7 @@ import { Reveal } from '@/components/ui/Reveal';
 import { useInView, usePrefersReducedMotion } from '@/lib/motion';
 import { PHASE1_TIMELINE, PHASE2_TIMELINE, type TimelineBar } from '@/data/simulation';
 import { TTFT_BATCHED_UNDER_LOAD_MS } from '@/data/benchmarks';
-import { compareSystems } from '@/data/gpuBenchmarks';
+import { compareSystems, servingPeak } from '@/data/gpuBenchmarks';
 
 type Mode = 'phase1' | 'phase2';
 
@@ -221,7 +221,7 @@ export function Phase1vs2Section() {
           </div>
         </Reveal>
 
-        {/* v3 comparison cards — local smoke runs */}
+        {/* v3 comparison cards — NVIDIA T4 (Colab) */}
         <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-3">
           {V3_CARDS.map((s, i) => (
             <Reveal key={s.label} delay={i * 90}>
@@ -230,7 +230,7 @@ export function Phase1vs2Section() {
           ))}
         </div>
         <p className="mt-2 font-mono text-[10.5px] text-fg-4">
-          v3 cards: small local smoke runs · Apple M2 (MPS) · Qwen2-0.5B fp16 · output tokens/s
+          v3 cards: NVIDIA T4 (Colab) · Qwen2.5-1.5B-Instruct fp16 · output tokens/s
         </p>
 
         <Reveal>
@@ -244,10 +244,17 @@ export function Phase1vs2Section() {
 const tokS = (v: number | null) => (v === null ? '–' : `${v.toFixed(1)} tok/s`);
 const times = (v: number | null) => (v === null ? '–' : `${v.toFixed(1)}×`);
 
+const seqPeak = servingPeak('t4', 'random', 'sequential');
+const contPeak = servingPeak('t4', 'random', 'continuous');
+
 const V3_CARDS = [
-  { label: 'v3 · 8 concurrent × 64 tokens', cmp: compareSystems('m2-mps', 'concurrency/concurrent', 'hf_sequential', 'engine'), beforeLabel: 'HF sequential' },
-  { label: 'v3 · vs HF sequential (16 req)', cmp: compareSystems('m2-mps', 'batching/random', 'hf_sequential', 'engine'), beforeLabel: 'HF sequential' },
-  { label: 'v3 · vs HF static batching', cmp: compareSystems('m2-mps', 'batching/random', 'hf_static_batch', 'engine'), beforeLabel: 'static batching' },
+  { label: 'v3 · offline, 128 requests', cmp: compareSystems('t4', 'batching/random', 'hf_sequential', 'engine'), beforeLabel: 'HF sequential' },
+  { label: 'v3 · vs HF static batching', cmp: compareSystems('t4', 'batching/random', 'hf_static_batch', 'engine'), beforeLabel: 'static batching' },
+  {
+    label: 'v3 · serving capacity (peak)',
+    cmp: { from: seqPeak, to: contPeak, ratio: seqPeak && contPeak ? contPeak / seqPeak : null },
+    beforeLabel: 'Phase 1 server',
+  },
 ].map((c) => ({ label: c.label, before: `${c.beforeLabel} ${tokS(c.cmp.from)}`, after: tokS(c.cmp.to), delta: times(c.cmp.ratio) }));
 
 function StatDiff({ label, before, after, delta }: { label: string; before: string; after: string; delta: string }) {

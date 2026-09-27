@@ -7,12 +7,13 @@ import { Reveal } from '@/components/ui/Reveal';
 import { SEQ_COLORS, useInView, usePrefersReducedMotion } from '@/lib/motion';
 import { compareSystems, platform } from '@/data/gpuBenchmarks';
 
-const prefix = compareSystems('m2-mps', 'prefix/shared_prefix', 'engine', 'engine+prefix');
-const spec = compareSystems('m2-mps', 'spec/single_request', 'engine', 'engine+ngram');
-const mps = platform('m2-mps');
-const prefixHit = mps?.offline?.runs.find((r) => r.system === 'engine+prefix')?.metrics.prefix_cache_hit_rate;
-const specRun = mps?.offline?.runs.find((r) => r.system === 'engine+ngram')?.metrics;
-const specNote = mps?.offline?.notes?.['spec/single_request'];
+// Figures: NVIDIA T4 (Colab), Qwen2.5-1.5B-Instruct fp16, offline ablation.
+const prefix = compareSystems('t4', 'prefix/shared_prefix', 'engine', 'engine+prefix');
+const spec = compareSystems('t4', 'spec/repetitive', 'engine', 'engine+ngram');
+const t4 = platform('t4');
+const prefixHit = t4?.offline?.runs.find((r) => r.suite === 'prefix' && r.system === 'engine+prefix')?.metrics.prefix_cache_hit_rate;
+const specRun = t4?.offline?.runs.find((r) => r.workload === 'repetitive' && r.system === 'engine+ngram')?.metrics;
+const specNote = t4?.offline?.notes?.['spec/chat'];
 
 const fx = (v: number | null | undefined, d = 1) => (typeof v === 'number' ? v.toFixed(d) : '–');
 
@@ -20,7 +21,7 @@ function SmokeStat({ from, to, ratio, extra }: { from: number | null; to: number
   return (
     <div className="mt-5 flex flex-wrap items-end justify-between gap-3 border-t border-line pt-4">
       <div>
-        <p className="font-mono text-[10px] uppercase tracking-[0.14em] text-fg-4">M2 smoke run · output tok/s</p>
+        <p className="font-mono text-[10px] uppercase tracking-[0.14em] text-fg-4">T4 · output tok/s</p>
         <p className="mt-1 font-mono text-[13px] text-fg-2">
           <span className="text-fg-3 line-through decoration-rose/50">{fx(from)}</span> → <span className="text-fg">{fx(to)}</span>
           {extra}
@@ -206,7 +207,7 @@ export function V3FeaturesSection() {
                 extra={
                   specRun && (
                     <span className="ml-2 text-violet">
-                      · {Math.round((specRun.spec_acceptance_rate ?? 0) * 100)}% accepted · {String(specRun.tokens_per_step)} tok/step
+                      · {Math.round((specRun.spec_acceptance_rate ?? 0) * 100)}% accepted · copy-heavy output
                     </span>
                   )
                 }
@@ -234,7 +235,7 @@ export function V3FeaturesSection() {
           ))}
         </div>
         <p className="mt-3 font-mono text-[10.5px] text-fg-4">
-          Figures: small local smoke runs · Apple M2 (MPS) · Qwen2-0.5B fp16. The draft-token animation is illustrative.
+          Figures: NVIDIA T4 (Colab) · Qwen2.5-1.5B-Instruct fp16 · offline ablation. The draft-token animation is illustrative.
         </p>
       </div>
     </section>
