@@ -2,7 +2,7 @@
 server/app.py — FastAPI server for sequential LLM inference.
 
 Sequential constraint — enforced at two layers
-----------------------------------------------
+---------------------------------------------
 1. asyncio.Lock (inference_lock): makes the "one request at a time" rule
    explicit and visible at the application layer.  If a second request arrives
    while inference is running, it waits on the lock before entering the
